@@ -1,0 +1,980 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Society Attendance Manager</title>
+
+  <!-- Firebase SDKs -->
+  <script type="module">
+    // ============================================================
+    // CONFIGURATION — replace with your own Firebase project values
+    // ============================================================
+    import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-app.js";
+    import {
+      getAuth, GoogleAuthProvider, signInWithPopup, createUserWithEmailAndPassword,
+      signInWithEmailAndPassword, sendPasswordResetEmail, signOut, onAuthStateChanged
+    } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-auth.js";
+    import {
+      getFirestore, collection, doc, setDoc, getDoc, getDocs, updateDoc,
+      onSnapshot, serverTimestamp, query, where, orderBy
+    } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js";
+
+    const firebaseConfig = {
+      apiKey:            "AIzaSyB2sw1RGACABcDkzJhViZOBN4cwfw0WXp0",
+      authDomain:        "society-attendance.firebaseapp.com",
+      projectId:         "society-attendance",
+      storageBucket:     "society-attendance.firebasestorage.app",
+      messagingSenderId: "913422861145",
+      appId:             "1:913422861145:web:3fb37fdb4e314167ad0248"
+    };
+
+    // EmailJS config — sign up at https://www.emailjs.com (free tier)
+    const EMAILJS_SERVICE_ID  = "service_b1mllxr";
+    const EMAILJS_TEMPLATE_ID = "template_q9jbgne";
+    const EMAILJS_PUBLIC_KEY  = "wRVjKCC0cwQz6Trdt";
+
+    // ============================================================
+    const app  = initializeApp(firebaseConfig);
+    const auth = getAuth(app);
+    const db   = getFirestore(app);
+
+    // ── helpers ──────────────────────────────────────────────────
+    const pad  = n => String(n).padStart(2,"0");
+    const dayKey = (d = new Date()) => `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}`;
+    const fmt12  = iso => { const d=new Date(iso); let h=d.getHours(),m=d.getMinutes(),ap=h>=12?"PM":"AM"; h=h%12||12; return `${h}:${pad(m)} ${ap}`; };
+    const todayFull = () => new Date().toLocaleDateString("en-IN",{weekday:"long",year:"numeric",month:"long",day:"numeric"});
+
+    // ── state ─────────────────────────────────────────────────────
+    let currentUser   = null;   // Firebase user
+    let adminProfile  = null;   // Firestore /admins/{uid}
+    let staffProfile  = null;   // Firestore /staff/{uid}
+    let role          = null;   // "admin" | "staff"
+    let unsubLogs     = null;
+    let unsubStaff    = null;
+    let clockInterval = null;
+
+    // ── EmailJS loader ────────────────────────────────────────────
+    function loadEmailJS() {
+      return new Promise(resolve => {
+        if (window.emailjs) { resolve(); return; }
+        const s = document.createElement("script");
+        s.src = "https://cdn.jsdelivr.net/npm/@emailjs/browser@4/dist/email.min.js";
+        s.onload = () => { emailjs.init(EMAILJS_PUBLIC_KEY); resolve(); };
+        document.head.appendChild(s);
+      });
+    }
+
+    async function sendEmailNotification({staffName, staffEmail, action, time, adminEmail, societyName}) {
+      try {
+        await loadEmailJS();
+        await emailjs.send(EMAILJS_SERVICE_ID, EMAILJS_TEMPLATE_ID, {
+          to_email:    adminEmail,
+          from_name:   societyName || "Society Office",
+          staff_name:  staffName,
+          staff_email: staffEmail,
+          action:      action === "in" ? "Checked IN" : "Checked OUT",
+          time:        time,
+          date:        new Date().toLocaleDateString("en-IN"),
+        });
+        showToast("✅ Notification sent to admin email","success");
+      } catch(e) {
+        showToast("⚠️ Email send failed – check EmailJS config","warn");
+        console.error(e);
+      }
+    }
+
+    // ── UI helpers ────────────────────────────────────────────────
+    const $ = id => document.getElementById(id);
+    const showSection = id => {
+      document.querySelectorAll(".section").forEach(s => s.classList.add("hidden"));
+      $(id).classList.remove("hidden");
+    };
+
+    function showToast(msg, type="info") {
+      const t = document.createElement("div");
+      t.className = `toast toast-${type}`;
+      t.textContent = msg;
+      document.body.appendChild(t);
+      setTimeout(()=>t.classList.add("show"),10);
+      setTimeout(()=>{ t.classList.remove("show"); setTimeout(()=>t.remove(),400); },3500);
+    }
+
+    function startClock() {
+      const el = $("live-clock");
+      if (!el) return;
+      clockInterval && clearInterval(clockInterval);
+      const tick = () => { el.textContent = new Date().toLocaleTimeString("en-IN",{hour:"2-digit",minute:"2-digit",second:"2-digit"}); };
+      tick(); clockInterval = setInterval(tick, 1000);
+    }
+
+    // ══════════════════════════════════════════════════════════════
+    //  AUTH FLOW
+    // ══════════════════════════════════════════════════════════════
+    onAuthStateChanged(auth, async user => {
+      if (!user) { showSection("auth-section"); return; }
+      currentUser = user;
+      // Check if admin
+      const adminSnap = await getDoc(doc(db,"admins",user.uid));
+      if (adminSnap.exists()) {
+        adminProfile = adminSnap.data();
+        role = "admin";
+        loadAdminDashboard();
+        return;
+      }
+      // Check if staff (matched by email)
+      const staffQ = query(collection(db,"staff"), where("email","==",user.email));
+      const staffSnap = await getDocs(staffQ);
+      if (!staffSnap.empty) {
+        staffProfile = { id: staffSnap.docs[0].id, ...staffSnap.docs[0].data() };
+        // Store the uid on the staff doc for future logins
+        if (!staffProfile.uid) {
+          await updateDoc(doc(db,"staff",staffProfile.id),{ uid: user.uid });
+          staffProfile.uid = user.uid;
+        }
+        role = "staff";
+        loadStaffDashboard();
+        return;
+      }
+      // Unknown user
+      showToast("Account not recognised. Contact your society admin.","warn");
+      await signOut(auth);
+    });
+
+    // ── Google Sign-In ────────────────────────────────────────────
+    window.googleSignIn = async () => {
+      try {
+        await signInWithPopup(auth, new GoogleAuthProvider());
+      } catch(e) { showToast(e.message,"error"); }
+    };
+
+    // ── Admin register ────────────────────────────────────────────
+    window.adminRegister = async () => {
+      const email   = $("reg-email").value.trim();
+      const pass    = $("reg-pass").value;
+      const society = $("reg-society").value.trim();
+      if (!email||!pass||!society) { showToast("Fill all fields","warn"); return; }
+      try {
+        const cred = await createUserWithEmailAndPassword(auth, email, pass);
+        await setDoc(doc(db,"admins",cred.user.uid),{
+          email, society, createdAt: serverTimestamp()
+        });
+        showToast("Admin account created!","success");
+      } catch(e) { showToast(e.message,"error"); }
+    };
+
+    // ── Admin login ────────────────────────────────────────────────
+    window.adminLogin = async () => {
+      const email = $("login-email").value.trim();
+      const pass  = $("login-pass").value;
+      try {
+        await signInWithEmailAndPassword(auth, email, pass);
+      } catch(e) { showToast(e.message,"error"); }
+    };
+
+    // ── Forgot password ───────────────────────────────────────────
+    window.forgotPassword = async () => {
+      const email = $("login-email").value.trim();
+      if (!email) { showToast("Enter your email first","warn"); return; }
+      await sendPasswordResetEmail(auth, email);
+      showToast("Password reset link sent to "+email,"success");
+    };
+
+    // ── Sign out ──────────────────────────────────────────────────
+    window.doSignOut = async () => {
+      unsubLogs && unsubLogs();
+      unsubStaff && unsubStaff();
+      clearInterval(clockInterval);
+      adminProfile = staffProfile = role = null;
+      await signOut(auth);
+    };
+
+    // ── Toggle auth tabs ──────────────────────────────────────────
+    window.showTab = tab => {
+      document.querySelectorAll(".auth-tab-panel").forEach(p=>p.classList.add("hidden"));
+      document.querySelectorAll(".tab-btn").forEach(b=>b.classList.remove("active"));
+      $(`tab-${tab}`).classList.remove("hidden");
+      document.querySelector(`[data-tab="${tab}"]`).classList.add("active");
+    };
+
+    // ══════════════════════════════════════════════════════════════
+    //  ADMIN DASHBOARD
+    // ══════════════════════════════════════════════════════════════
+    function loadAdminDashboard() {
+      showSection("admin-section");
+      $("admin-society").textContent = adminProfile.society;
+      $("admin-email-display").textContent = adminProfile.email;
+      $("admin-date").textContent = todayFull();
+      startClock();
+      loadStaffList();
+      loadTodayAttendance();
+      showAdminTab("attendance");
+    }
+
+    window.showAdminTab = tab => {
+      document.querySelectorAll(".admin-panel").forEach(p=>p.classList.add("hidden"));
+      document.querySelectorAll(".admin-tab-btn").forEach(b=>b.classList.remove("active"));
+      $(`admin-panel-${tab}`).classList.remove("hidden");
+      document.querySelector(`[data-admin-tab="${tab}"]`).classList.add("active");
+    };
+
+    // ── Staff list (admin) ────────────────────────────────────────
+    function loadStaffList() {
+      const listEl = $("staff-list-admin");
+      unsubStaff && unsubStaff();
+      unsubStaff = onSnapshot(collection(db,"staff"), snap => {
+        const staff = snap.docs.map(d=>({id:d.id,...d.data()}));
+        renderStaffList(staff, listEl);
+        loadTodayAttendance(staff); // refresh attendance table
+      });
+    }
+
+    function renderStaffList(staff, container) {
+      if (!staff.length) {
+        container.innerHTML = `<div class="empty-state">No staff added yet. Use the form above to add your first staff member.</div>`;
+        return;
+      }
+      container.innerHTML = staff.map(s => `
+        <div class="staff-card">
+          <div class="staff-avatar">${initials(s.name)}</div>
+          <div class="staff-info">
+            <div class="staff-name">${s.name}</div>
+            <div class="staff-meta">${s.designation} · ${s.email}</div>
+            <div class="staff-meta">Shift: ${s.shiftStart} – ${s.shiftEnd}</div>
+          </div>
+          <div class="staff-actions">
+            <button class="btn-icon btn-edit" onclick="editStaff('${s.id}','${esc(s.name)}','${esc(s.email)}','${esc(s.designation)}','${s.shiftStart}','${s.shiftEnd}')">✏️</button>
+            <button class="btn-icon btn-del" onclick="deleteStaff('${s.id}','${esc(s.name)}')">🗑</button>
+          </div>
+        </div>`).join("");
+    }
+
+    const esc = v => (v||"").replace(/'/g,"\\'");
+    const initials = name => (name||"?").split(" ").map(p=>p[0]).slice(0,2).join("").toUpperCase();
+
+    // ── Add staff ─────────────────────────────────────────────────
+    window.addStaff = async () => {
+      const name    = $("new-name").value.trim();
+      const email   = $("new-email").value.trim().toLowerCase();
+      const desig   = $("new-desig").value.trim();
+      const shiftS  = $("new-shift-start").value;
+      const shiftE  = $("new-shift-end").value;
+      if (!name||!email||!desig||!shiftS||!shiftE) { showToast("Fill all fields","warn"); return; }
+      const id = email.replace(/[^a-z0-9]/g,"_");
+      await setDoc(doc(db,"staff",id),{
+        name, email, designation: desig, shiftStart: shiftS, shiftEnd: shiftE,
+        adminUid: currentUser.uid, createdAt: serverTimestamp()
+      });
+      ["new-name","new-email","new-desig","new-shift-start","new-shift-end"].forEach(f=>$(f).value="");
+      showToast(`${name} added. They can now log in with ${email}.`,"success");
+    };
+
+    // ── Edit staff ────────────────────────────────────────────────
+    window.editStaff = (id,name,email,desig,shiftS,shiftE) => {
+      const modal = $("edit-modal");
+      $("edit-id").value    = id;
+      $("edit-name").value  = name;
+      $("edit-email").value = email;
+      $("edit-desig").value = desig;
+      $("edit-shift-start").value = shiftS;
+      $("edit-shift-end").value   = shiftE;
+      modal.classList.remove("hidden");
+    };
+
+    window.saveEdit = async () => {
+      const id    = $("edit-id").value;
+      const name  = $("edit-name").value.trim();
+      const desig = $("edit-desig").value.trim();
+      const shiftS= $("edit-shift-start").value;
+      const shiftE= $("edit-shift-end").value;
+      await updateDoc(doc(db,"staff",id),{name,designation:desig,shiftStart:shiftS,shiftEnd:shiftE});
+      $("edit-modal").classList.add("hidden");
+      showToast("Staff details updated","success");
+    };
+
+    window.closeEditModal = () => $("edit-modal").classList.add("hidden");
+
+    // ── Delete staff ──────────────────────────────────────────────
+    window.deleteStaff = async (id,name) => {
+      if (!confirm(`Remove ${name} from the system?`)) return;
+      const { deleteDoc } = await import("https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js");
+      await deleteDoc(doc(db,"staff",id));
+      showToast(`${name} removed`,"info");
+    };
+
+    // ── Today attendance (admin) ──────────────────────────────────
+    async function loadTodayAttendance(staffList) {
+      const key = dayKey();
+      const logsRef = collection(db,"attendance");
+      const q = query(logsRef, where("date","==",key));
+      unsubLogs && unsubLogs();
+      unsubLogs = onSnapshot(q, async snap => {
+        const logMap = {};
+        snap.docs.forEach(d=>{ logMap[d.data().staffId]=d.data(); });
+        // get staff if not passed
+        if (!staffList) {
+          const sSnap = await getDocs(collection(db,"staff"));
+          staffList = sSnap.docs.map(d=>({id:d.id,...d.data()}));
+        }
+        renderAttendanceTable(staffList, logMap, key);
+        renderSummaryCards(staffList, logMap);
+      });
+    }
+
+    function renderAttendanceTable(staff, logMap, date) {
+      const tbody = $("attendance-tbody");
+      if (!staff.length) { tbody.innerHTML=`<tr><td colspan="7" class="empty-state">No staff yet</td></tr>`; return; }
+      tbody.innerHTML = staff.map(s => {
+        const log = logMap[s.id] || {};
+        const inTime  = log.checkIn  ? fmt12(log.checkIn)  : "—";
+        const outTime = log.checkOut ? fmt12(log.checkOut) : "—";
+        const late = log.checkIn ? isLate(log.checkIn, s.shiftStart) : false;
+        const dur  = log.checkIn && log.checkOut ? getDuration(log.checkIn, log.checkOut) : "—";
+        const status = !log.checkIn ? "Absent" : !log.checkOut ? "Checked In" : "Completed";
+        return `<tr>
+          <td><b>${s.name}</b></td>
+          <td>${s.designation}</td>
+          <td class="mono">${s.shiftStart}</td>
+          <td class="mono">${inTime}${late?`<span class="late-badge">Late</span>`:""}</td>
+          <td class="mono">${outTime}</td>
+          <td class="mono">${dur}</td>
+          <td><span class="status-badge status-${status.toLowerCase().replace(" ","-")}">${status}</span></td>
+        </tr>`;
+      }).join("");
+    }
+
+    function renderSummaryCards(staff, logMap) {
+      const present = staff.filter(s=>logMap[s.id]?.checkIn).length;
+      const late    = staff.filter(s=>logMap[s.id]?.checkIn && isLate(logMap[s.id].checkIn, s.shiftStart)).length;
+      const absent  = staff.length - present;
+      $("card-total").textContent   = staff.length;
+      $("card-present").textContent = present;
+      $("card-late").textContent    = late;
+      $("card-absent").textContent  = absent;
+    }
+
+    function isLate(checkInIso, shiftStart) {
+      if (!checkInIso||!shiftStart) return false;
+      const d=new Date(checkInIso), [sh,sm]=shiftStart.split(":").map(Number);
+      return (d.getHours()*60+d.getMinutes()) > (sh*60+sm);
+    }
+
+    function getDuration(inIso,outIso) {
+      const mins = Math.round((new Date(outIso)-new Date(inIso))/60000);
+      return `${Math.floor(mins/60)}h ${pad(mins%60)}m`;
+    }
+
+    // ── Export CSV ────────────────────────────────────────────────
+    window.exportCSV = async () => {
+      const sSnap = await getDocs(collection(db,"staff"));
+      const staff = sSnap.docs.map(d=>({id:d.id,...d.data()}));
+      const key   = dayKey();
+      const lQ    = query(collection(db,"attendance"),where("date","==",key));
+      const lSnap = await getDocs(lQ);
+      const logMap={};
+      lSnap.docs.forEach(d=>{ logMap[d.data().staffId]=d.data(); });
+      const rows = [["Date","Name","Designation","Shift","Check In","Check Out","Hours","Status","Late"]];
+      staff.forEach(s=>{
+        const log=logMap[s.id]||{};
+        const dur=log.checkIn&&log.checkOut?getDuration(log.checkIn,log.checkOut):"";
+        const status=!log.checkIn?"Absent":!log.checkOut?"Checked In":"Completed";
+        rows.push([key,s.name,s.designation,s.shiftStart,
+          log.checkIn?fmt12(log.checkIn):"",log.checkOut?fmt12(log.checkOut):"",
+          dur,status,log.checkIn&&isLate(log.checkIn,s.shiftStart)?"Yes":"No"]);
+      });
+      const csv=rows.map(r=>r.map(v=>`"${v}"`).join(",")).join("\n");
+      const a=document.createElement("a");
+      a.href="data:text/csv;charset=utf-8,"+encodeURIComponent(csv);
+      a.download=`attendance_${key}.csv`; a.click();
+    };
+
+    // ══════════════════════════════════════════════════════════════
+    //  STAFF DASHBOARD
+    // ══════════════════════════════════════════════════════════════
+    async function loadStaffDashboard() {
+      showSection("staff-section");
+      $("staff-welcome").textContent = staffProfile.name;
+      $("staff-role").textContent    = staffProfile.designation;
+      $("staff-shift").textContent   = `Shift: ${staffProfile.shiftStart} – ${staffProfile.shiftEnd}`;
+      $("staff-date").textContent    = todayFull();
+      startClock();
+      listenStaffLog();
+    }
+
+    function listenStaffLog() {
+      const key = dayKey();
+      const logRef = doc(db,"attendance",`${staffProfile.id}_${key}`);
+      onSnapshot(logRef, snap => {
+        const data = snap.exists() ? snap.data() : {};
+        updateStaffUI(data);
+      });
+    }
+
+    function updateStaffUI(log) {
+      const inBtn  = $("btn-checkin");
+      const outBtn = $("btn-checkout");
+      const inEl   = $("display-in");
+      const outEl  = $("display-out");
+      inEl.textContent  = log.checkIn  ? fmt12(log.checkIn)  : "—";
+      outEl.textContent = log.checkOut ? fmt12(log.checkOut) : "—";
+      if (!log.checkIn) {
+        inBtn.disabled  = false;
+        outBtn.disabled = true;
+        $("checkin-send-email").classList.add("hidden");
+        $("checkout-send-email").classList.add("hidden");
+      } else if (!log.checkOut) {
+        inBtn.disabled  = true;
+        outBtn.disabled = false;
+        $("checkin-send-email").classList.remove("hidden");
+        $("checkout-send-email").classList.add("hidden");
+      } else {
+        inBtn.disabled  = true;
+        outBtn.disabled = true;
+        $("checkin-send-email").classList.remove("hidden");
+        $("checkout-send-email").classList.remove("hidden");
+      }
+    }
+
+    window.doCheckIn = async () => {
+      const key   = dayKey();
+      const now   = new Date().toISOString();
+      const logId = `${staffProfile.id}_${key}`;
+      await setDoc(doc(db,"attendance",logId),{
+        staffId:   staffProfile.id,
+        staffName: staffProfile.name,
+        staffEmail:staffProfile.email,
+        date: key,
+        checkIn: now,
+        checkOut: null,
+        adminUid: staffProfile.adminUid,
+      },{merge:true});
+      showToast("✅ Checked in at "+fmt12(now),"success");
+    };
+
+    window.doCheckOut = async () => {
+      const key   = dayKey();
+      const now   = new Date().toISOString();
+      const logId = `${staffProfile.id}_${key}`;
+      await updateDoc(doc(db,"attendance",logId),{ checkOut: now });
+      showToast("🏁 Checked out at "+fmt12(now),"info");
+    };
+
+    async function getAdminEmail() {
+      if (!staffProfile.adminUid) return null;
+      const snap = await getDoc(doc(db,"admins",staffProfile.adminUid));
+      return snap.exists() ? snap.data().email : null;
+    }
+
+    window.sendCheckInEmail = async () => {
+      const key   = dayKey();
+      const snap  = await getDoc(doc(db,"attendance",`${staffProfile.id}_${key}`));
+      if (!snap.exists()) { showToast("No check-in record found","warn"); return; }
+      const log = snap.data();
+      const adminEmail = await getAdminEmail();
+      if (!adminEmail) { showToast("Admin email not found","warn"); return; }
+      const adminSnap = await getDoc(doc(db,"admins",staffProfile.adminUid));
+      const societyName = adminSnap.exists() ? adminSnap.data().society : "Society";
+      $("checkin-send-email").disabled = true;
+      await sendEmailNotification({
+        staffName: staffProfile.name, staffEmail: staffProfile.email,
+        action:"in", time: fmt12(log.checkIn), adminEmail, societyName
+      });
+      $("checkin-send-email").disabled = false;
+    };
+
+    window.sendCheckOutEmail = async () => {
+      const key  = dayKey();
+      const snap = await getDoc(doc(db,"attendance",`${staffProfile.id}_${key}`));
+      if (!snap.exists()) { showToast("No log found","warn"); return; }
+      const log = snap.data();
+      const adminEmail = await getAdminEmail();
+      if (!adminEmail) { showToast("Admin email not found","warn"); return; }
+      const adminSnap  = await getDoc(doc(db,"admins",staffProfile.adminUid));
+      const societyName= adminSnap.exists() ? adminSnap.data().society : "Society";
+      $("checkout-send-email").disabled = true;
+      await sendEmailNotification({
+        staffName: staffProfile.name, staffEmail: staffProfile.email,
+        action:"out", time: fmt12(log.checkOut), adminEmail, societyName
+      });
+      $("checkout-send-email").disabled = false;
+    };
+  </script>
+
+  <style>
+    /* ── Reset & Variables ─────────────────────── */
+    *, *::before, *::after { box-sizing: border-box; margin:0; padding:0; }
+    :root {
+      --bg:       #0F1923;
+      --surface:  #172130;
+      --card:     #1E2D3D;
+      --accent:   #00C9A7;
+      --accent2:  #FF6B6B;
+      --amber:    #FFB347;
+      --text:     #E8EDF2;
+      --muted:    #8FA3B8;
+      --border:   #263547;
+      --radius:   14px;
+      --mono:     'JetBrains Mono','SF Mono',Consolas,monospace;
+    }
+    body { background:var(--bg); color:var(--text); font-family:'Inter',system-ui,sans-serif; min-height:100vh; }
+    .hidden { display:none !important; }
+    a { color:var(--accent); text-decoration:none; }
+
+    /* ── Toast ─────────────────────────────────── */
+    .toast {
+      position:fixed; bottom:24px; left:50%; transform:translateX(-50%) translateY(20px);
+      background:var(--card); border:1px solid var(--border); color:var(--text);
+      padding:12px 20px; border-radius:40px; font-size:13.5px; font-weight:600;
+      opacity:0; transition:.3s; z-index:9999; white-space:nowrap;
+      box-shadow:0 8px 32px rgba(0,0,0,.4);
+    }
+    .toast.show { opacity:1; transform:translateX(-50%) translateY(0); }
+    .toast-success { border-color:var(--accent); }
+    .toast-error   { border-color:var(--accent2); }
+    .toast-warn    { border-color:var(--amber); }
+
+    /* ── Layout ────────────────────────────────── */
+    .section { max-width:960px; margin:0 auto; padding:32px 20px; }
+    header {
+      display:flex; justify-content:space-between; align-items:center;
+      padding:14px 28px; background:var(--surface);
+      border-bottom:1px solid var(--border); position:sticky; top:0; z-index:10;
+    }
+    .logo { display:flex; align-items:center; gap:10px; }
+    .logo-mark {
+      width:36px; height:36px; border-radius:10px;
+      background:var(--accent); display:flex; align-items:center; justify-content:center;
+      font-size:18px;
+    }
+    .logo-text { font-weight:800; font-size:16px; letter-spacing:-.5px; }
+    .logo-sub  { font-size:11px; color:var(--muted); }
+
+    /* ── Auth ──────────────────────────────────── */
+    #auth-section {
+      display:flex; flex-direction:column; align-items:center; justify-content:center;
+      min-height:100vh; padding:20px; gap:0;
+    }
+    .auth-card {
+      background:var(--surface); border:1px solid var(--border); border-radius:var(--radius);
+      padding:36px 32px; width:100%; max-width:420px;
+    }
+    .auth-title { font-size:22px; font-weight:800; margin-bottom:4px; }
+    .auth-sub   { font-size:13px; color:var(--muted); margin-bottom:28px; }
+    .tab-bar { display:flex; gap:4px; margin-bottom:24px; background:var(--bg); border-radius:10px; padding:4px; }
+    .tab-btn {
+      flex:1; border:none; background:transparent; color:var(--muted); padding:9px;
+      border-radius:8px; font-size:13px; font-weight:600; cursor:pointer; transition:.2s;
+    }
+    .tab-btn.active { background:var(--card); color:var(--text); }
+    .auth-tab-panel { display:flex; flex-direction:column; gap:12px; }
+
+    /* ── Form controls ─────────────────────────── */
+    .input-group { display:flex; flex-direction:column; gap:5px; }
+    .input-group label { font-size:12px; color:var(--muted); font-weight:600; text-transform:uppercase; letter-spacing:.04em; }
+    input, select {
+      background:var(--bg); border:1px solid var(--border); border-radius:9px;
+      padding:11px 14px; color:var(--text); font-size:14px; font-family:inherit;
+      transition:.2s; outline:none; width:100%;
+    }
+    input:focus, select:focus { border-color:var(--accent); box-shadow:0 0 0 3px rgba(0,201,167,.12); }
+    input[type="time"] { font-family:var(--mono); }
+
+    /* ── Buttons ───────────────────────────────── */
+    .btn {
+      border:none; border-radius:10px; padding:12px 18px; font-size:14px;
+      font-weight:700; cursor:pointer; display:flex; align-items:center;
+      justify-content:center; gap:7px; transition:.2s; width:100%;
+    }
+    .btn-primary  { background:var(--accent); color:#0F1923; }
+    .btn-primary:hover { filter:brightness(1.1); }
+    .btn-secondary{ background:var(--card); color:var(--text); border:1px solid var(--border); }
+    .btn-secondary:hover { border-color:var(--accent); }
+    .btn-danger   { background:rgba(255,107,107,.15); color:var(--accent2); border:1px solid var(--accent2); }
+    .btn-google   { background:#fff; color:#1B2430; }
+    .btn-icon     { background:var(--card); border:1px solid var(--border); border-radius:8px; padding:7px 10px; cursor:pointer; font-size:15px; }
+    .btn-edit     { background:rgba(0,201,167,.1); border-color:var(--accent); }
+    .btn-del      { background:rgba(255,107,107,.1); border-color:var(--accent2); }
+    .btn:disabled { opacity:.4; cursor:not-allowed; }
+    .btn-email    { background:rgba(255,179,71,.12); color:var(--amber); border:1px solid var(--amber); border-radius:10px; padding:12px 20px; font-size:14px; font-weight:700; cursor:pointer; display:flex; align-items:center; gap:8px; transition:.2s; }
+    .btn-email:hover { background:rgba(255,179,71,.22); }
+    .divider      { text-align:center; color:var(--muted); font-size:12px; margin:8px 0; }
+
+    /* ── Top nav ───────────────────────────────── */
+    .topnav { background:var(--surface); border-bottom:1px solid var(--border); position:sticky; top:0; z-index:10; }
+    .topnav-inner { max-width:960px; margin:0 auto; padding:14px 20px; display:flex; justify-content:space-between; align-items:center; }
+    .user-pill { display:flex; align-items:center; gap:8px; }
+    .avatar-sm { width:32px; height:32px; border-radius:50%; background:var(--accent); display:flex; align-items:center; justify-content:center; font-weight:700; font-size:13px; color:#0F1923; }
+    .signout-btn { background:transparent; border:1px solid var(--border); border-radius:8px; padding:7px 12px; color:var(--muted); font-size:13px; cursor:pointer; transition:.2s; }
+    .signout-btn:hover { border-color:var(--accent2); color:var(--accent2); }
+
+    /* ── Admin tabs ────────────────────────────── */
+    .tab-row { display:flex; gap:6px; margin-bottom:24px; }
+    .admin-tab-btn {
+      border:1px solid var(--border); background:var(--surface); color:var(--muted);
+      border-radius:9px; padding:9px 18px; font-size:13px; font-weight:600; cursor:pointer; transition:.2s;
+    }
+    .admin-tab-btn.active { background:var(--accent); color:#0F1923; border-color:var(--accent); }
+
+    /* ── Summary cards ─────────────────────────── */
+    .summary-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr)); gap:12px; margin-bottom:24px; }
+    .summary-card {
+      background:var(--card); border:1px solid var(--border); border-radius:var(--radius);
+      padding:16px 18px;
+    }
+    .summary-label { font-size:11px; font-weight:700; color:var(--muted); text-transform:uppercase; letter-spacing:.05em; margin-bottom:8px; }
+    .summary-value { font-family:var(--mono); font-size:32px; font-weight:700; }
+    .summary-value.green { color:var(--accent); }
+    .summary-value.amber { color:var(--amber); }
+    .summary-value.red   { color:var(--accent2); }
+
+    /* ── Attendance table ──────────────────────── */
+    .table-wrap { background:var(--card); border:1px solid var(--border); border-radius:var(--radius); overflow:auto; }
+    table { width:100%; border-collapse:collapse; font-size:13.5px; }
+    th { text-align:left; padding:12px 16px; font-size:11px; font-weight:700; color:var(--muted); text-transform:uppercase; letter-spacing:.04em; border-bottom:1px solid var(--border); white-space:nowrap; }
+    td { padding:13px 16px; border-bottom:1px solid var(--border); vertical-align:middle; }
+    tr:last-child td { border-bottom:none; }
+    .mono { font-family:var(--mono); }
+    .late-badge { margin-left:7px; font-size:10px; font-weight:700; background:rgba(255,179,71,.18); color:var(--amber); padding:2px 7px; border-radius:5px; font-family:inherit; }
+    .status-badge { font-size:12px; font-weight:600; padding:4px 10px; border-radius:6px; }
+    .status-absent      { background:rgba(255,107,107,.12); color:var(--accent2); }
+    .status-checked-in  { background:rgba(255,179,71,.15);  color:var(--amber); }
+    .status-completed   { background:rgba(0,201,167,.12);   color:var(--accent); }
+
+    /* ── Staff cards ───────────────────────────── */
+    .staff-card {
+      background:var(--card); border:1px solid var(--border); border-radius:var(--radius);
+      padding:16px; display:flex; align-items:center; gap:14px; margin-bottom:10px;
+    }
+    .staff-avatar {
+      width:44px; height:44px; border-radius:50%; background:var(--accent);
+      display:flex; align-items:center; justify-content:center;
+      font-weight:800; font-size:15px; color:#0F1923; flex-shrink:0;
+    }
+    .staff-info  { flex:1; }
+    .staff-name  { font-weight:700; font-size:15px; }
+    .staff-meta  { font-size:12px; color:var(--muted); margin-top:2px; }
+    .staff-actions { display:flex; gap:8px; }
+
+    /* ── Add staff form ────────────────────────── */
+    .add-form {
+      background:var(--card); border:1px solid var(--border); border-radius:var(--radius);
+      padding:22px; margin-bottom:22px;
+    }
+    .add-form h3 { font-size:15px; margin-bottom:16px; }
+    .form-row { display:grid; grid-template-columns:1fr 1fr; gap:12px; margin-bottom:12px; }
+    @media(max-width:600px) { .form-row { grid-template-columns:1fr; } }
+
+    /* ── Staff dashboard ───────────────────────── */
+    .staff-hero {
+      background:var(--card); border:1px solid var(--border); border-radius:var(--radius);
+      padding:28px; text-align:center; margin-bottom:24px;
+    }
+    .big-avatar {
+      width:70px; height:70px; border-radius:50%; background:var(--accent);
+      display:flex; align-items:center; justify-content:center;
+      font-weight:800; font-size:26px; color:#0F1923; margin:0 auto 14px;
+    }
+    .big-clock { font-family:var(--mono); font-size:42px; font-weight:700; color:var(--accent); margin:10px 0; }
+    .time-grid { display:grid; grid-template-columns:1fr 1fr; gap:14px; margin:24px 0; }
+    .time-box {
+      background:var(--surface); border:1px solid var(--border); border-radius:12px;
+      padding:16px; text-align:center;
+    }
+    .time-label { font-size:11px; color:var(--muted); text-transform:uppercase; letter-spacing:.05em; font-weight:600; }
+    .time-value { font-family:var(--mono); font-size:22px; font-weight:700; margin-top:6px; }
+    .action-row { display:grid; grid-template-columns:1fr 1fr; gap:12px; margin-bottom:14px; }
+    .email-row  { display:grid; grid-template-columns:1fr 1fr; gap:12px; }
+    @media(max-width:480px) { .action-row,.email-row,.time-grid { grid-template-columns:1fr; } }
+
+    /* ── Modal ─────────────────────────────────── */
+    .modal-overlay {
+      position:fixed; inset:0; background:rgba(15,25,35,.75);
+      display:flex; align-items:center; justify-content:center; padding:20px; z-index:200;
+    }
+    .modal-box {
+      background:var(--surface); border:1px solid var(--border); border-radius:var(--radius);
+      padding:28px; width:100%; max-width:440px;
+    }
+    .modal-title { font-size:17px; font-weight:800; margin-bottom:20px; }
+    .modal-actions { display:flex; gap:10px; margin-top:20px; }
+
+    /* ── Misc ──────────────────────────────────── */
+    .empty-state { padding:40px; text-align:center; color:var(--muted); font-size:14px; }
+    .page-title  { font-size:22px; font-weight:800; margin-bottom:4px; }
+    .page-sub    { font-size:13px; color:var(--muted); margin-bottom:24px; }
+    .section-title { font-size:15px; font-weight:700; margin-bottom:14px; }
+    .row-between { display:flex; justify-content:space-between; align-items:center; margin-bottom:16px; flex-wrap:wrap; gap:10px; }
+  </style>
+</head>
+<body>
+
+<!-- ════════════════════════════════════════════════
+     AUTH SCREEN
+════════════════════════════════════════════════ -->
+<div id="auth-section" class="section">
+  <div style="text-align:center;margin-bottom:32px;">
+    <div style="width:56px;height:56px;border-radius:16px;background:var(--accent);display:flex;align-items:center;justify-content:center;font-size:28px;margin:0 auto 12px;">🏢</div>
+    <div style="font-size:24px;font-weight:800;">Society Attendance</div>
+    <div style="color:var(--muted);font-size:13px;margin-top:4px;">Secure staff attendance management</div>
+  </div>
+
+  <div class="auth-card">
+    <div class="tab-bar">
+      <button class="tab-btn active" data-tab="login" onclick="showTab('login')">Sign In</button>
+      <button class="tab-btn" data-tab="register" onclick="showTab('register')">Register Admin</button>
+    </div>
+
+    <!-- Login tab -->
+    <div id="tab-login" class="auth-tab-panel">
+      <button class="btn btn-google" onclick="googleSignIn()">
+        <svg width="18" height="18" viewBox="0 0 18 18"><path fill="#4285F4" d="M16.51 8H8.98v3h4.3c-.18 1-.74 1.48-1.6 2.04v2.01h2.6a7.8 7.8 0 0 0 2.38-5.88c0-.57-.05-.66-.15-1.18"/><path fill="#34A853" d="M8.98 17c2.16 0 3.97-.72 5.3-1.94l-2.6-2.01c-.72.48-1.63.76-2.7.76-2.08 0-3.84-1.4-4.47-3.29H1.87v2.08A8 8 0 0 0 8.98 17"/><path fill="#FBBC05" d="M4.51 10.52A4.8 4.8 0 0 1 4.26 9c0-.52.09-1.03.25-1.52V5.4H1.87A8 8 0 0 0 .98 9c0 1.29.31 2.51.89 3.6z"/><path fill="#EA4335" d="M8.98 3.58c1.17 0 2.23.4 3.06 1.2l2.3-2.3A8 8 0 0 0 8.98 1a8 8 0 0 0-7.11 4.39l2.64 2.05c.63-1.89 2.39-3.29 4.47-3.29"/></svg>
+        Sign in with Google (Admin / Staff)
+      </button>
+      <div class="divider">— or admin email/password —</div>
+      <div class="input-group">
+        <label>Email</label>
+        <input id="login-email" type="email" placeholder="admin@society.com" />
+      </div>
+      <div class="input-group">
+        <label>Password</label>
+        <input id="login-pass" type="password" placeholder="••••••••" />
+      </div>
+      <button class="btn btn-primary" onclick="adminLogin()">Sign In</button>
+      <div style="text-align:center;font-size:12px;color:var(--muted);">
+        <a href="#" onclick="forgotPassword()">Forgot password?</a>
+      </div>
+    </div>
+
+    <!-- Register tab -->
+    <div id="tab-register" class="auth-tab-panel hidden">
+      <div style="background:rgba(0,201,167,.08);border:1px solid rgba(0,201,167,.2);border-radius:10px;padding:12px 14px;font-size:13px;color:var(--muted);margin-bottom:4px;">
+        🔒 Register a new <b style="color:var(--text)">Society Admin</b> account. Staff members do NOT register here — admin adds them.
+      </div>
+      <div class="input-group">
+        <label>Society Name</label>
+        <input id="reg-society" type="text" placeholder="e.g. Greenview Residency" />
+      </div>
+      <div class="input-group">
+        <label>Admin Email</label>
+        <input id="reg-email" type="email" placeholder="admin@society.com" />
+      </div>
+      <div class="input-group">
+        <label>Password (min 6 chars)</label>
+        <input id="reg-pass" type="password" placeholder="••••••••" />
+      </div>
+      <button class="btn btn-primary" onclick="adminRegister()">Create Admin Account</button>
+    </div>
+  </div>
+</div>
+
+<!-- ════════════════════════════════════════════════
+     ADMIN DASHBOARD
+════════════════════════════════════════════════ -->
+<div id="admin-section" class="hidden">
+  <nav class="topnav">
+    <div class="topnav-inner">
+      <div class="logo">
+        <div class="logo-mark">🏢</div>
+        <div>
+          <div class="logo-text" id="admin-society">Society</div>
+          <div class="logo-sub" id="admin-email-display"></div>
+        </div>
+      </div>
+      <div class="user-pill">
+        <div id="live-clock" style="font-family:var(--mono);font-size:13px;color:var(--accent);"></div>
+        <button class="signout-btn" onclick="doSignOut()">Sign out</button>
+      </div>
+    </div>
+  </nav>
+
+  <div class="section" style="max-width:960px;margin:0 auto;padding:28px 20px;">
+    <div class="page-title">Admin Dashboard</div>
+    <div class="page-sub" id="admin-date"></div>
+
+    <div class="tab-row">
+      <button class="admin-tab-btn active" data-admin-tab="attendance" onclick="showAdminTab('attendance')">📋 Attendance</button>
+      <button class="admin-tab-btn" data-admin-tab="staff" onclick="showAdminTab('staff')">👥 Manage Staff</button>
+    </div>
+
+    <!-- Attendance panel -->
+    <div id="admin-panel-attendance">
+      <div class="summary-grid">
+        <div class="summary-card">
+          <div class="summary-label">Total Staff</div>
+          <div class="summary-value" id="card-total">—</div>
+        </div>
+        <div class="summary-card">
+          <div class="summary-label">Present</div>
+          <div class="summary-value green" id="card-present">—</div>
+        </div>
+        <div class="summary-card">
+          <div class="summary-label">Late</div>
+          <div class="summary-value amber" id="card-late">—</div>
+        </div>
+        <div class="summary-card">
+          <div class="summary-label">Absent</div>
+          <div class="summary-value red" id="card-absent">—</div>
+        </div>
+      </div>
+
+      <div class="row-between">
+        <div class="section-title" style="margin:0">Today's Records</div>
+        <button class="btn btn-secondary" style="width:auto;padding:9px 16px;" onclick="exportCSV()">⬇ Export CSV</button>
+      </div>
+
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Name</th><th>Designation</th><th>Shift</th>
+              <th>Check In</th><th>Check Out</th><th>Hours</th><th>Status</th>
+            </tr>
+          </thead>
+          <tbody id="attendance-tbody">
+            <tr><td colspan="7" class="empty-state">Loading…</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+    <!-- Staff panel -->
+    <div id="admin-panel-staff" class="hidden">
+      <div class="add-form">
+        <h3>➕ Add New Staff Member</h3>
+        <div class="form-row">
+          <div class="input-group">
+            <label>Full Name</label>
+            <input id="new-name" type="text" placeholder="e.g. Ravi Kumar" />
+          </div>
+          <div class="input-group">
+            <label>Email (used to login)</label>
+            <input id="new-email" type="email" placeholder="ravi@gmail.com" />
+          </div>
+        </div>
+        <div class="form-row">
+          <div class="input-group">
+            <label>Designation</label>
+            <input id="new-desig" type="text" placeholder="e.g. Security Guard" />
+          </div>
+          <div class="input-group" style="display:grid;grid-template-columns:1fr 1fr;gap:8px;">
+            <div class="input-group">
+              <label>Shift Start</label>
+              <input id="new-shift-start" type="time" value="09:00" />
+            </div>
+            <div class="input-group">
+              <label>Shift End</label>
+              <input id="new-shift-end" type="time" value="18:00" />
+            </div>
+          </div>
+        </div>
+        <button class="btn btn-primary" onclick="addStaff()">Add Staff Member</button>
+      </div>
+
+      <div class="section-title">All Staff</div>
+      <div id="staff-list-admin">
+        <div class="empty-state">Loading staff…</div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ════════════════════════════════════════════════
+     STAFF DASHBOARD
+════════════════════════════════════════════════ -->
+<div id="staff-section" class="hidden">
+  <nav class="topnav">
+    <div class="topnav-inner">
+      <div class="logo">
+        <div class="logo-mark">👤</div>
+        <div>
+          <div class="logo-text">My Attendance</div>
+        </div>
+      </div>
+      <div class="user-pill">
+        <div id="live-clock-staff" style="display:none"></div>
+        <button class="signout-btn" onclick="doSignOut()">Sign out</button>
+      </div>
+    </div>
+  </nav>
+
+  <div class="section" style="max-width:520px;margin:0 auto;padding:28px 20px;">
+    <div class="staff-hero">
+      <div class="big-avatar" id="staff-initials">?</div>
+      <div style="font-size:22px;font-weight:800;" id="staff-welcome">Staff</div>
+      <div style="color:var(--muted);font-size:13px;" id="staff-role"></div>
+      <div style="color:var(--muted);font-size:12px;margin-top:2px;" id="staff-shift"></div>
+      <div class="big-clock" id="live-clock"></div>
+      <div style="font-size:13px;color:var(--muted);" id="staff-date"></div>
+    </div>
+
+    <div class="time-grid">
+      <div class="time-box">
+        <div class="time-label">Check In</div>
+        <div class="time-value" id="display-in" style="color:var(--accent);">—</div>
+      </div>
+      <div class="time-box">
+        <div class="time-label">Check Out</div>
+        <div class="time-value" id="display-out" style="color:var(--accent2);">—</div>
+      </div>
+    </div>
+
+    <div class="action-row">
+      <button class="btn btn-primary" id="btn-checkin" onclick="doCheckIn()">✅ Check In</button>
+      <button class="btn btn-danger"  id="btn-checkout" onclick="doCheckOut()" disabled>🏁 Check Out</button>
+    </div>
+
+    <div class="email-row">
+      <button class="btn-email hidden" id="checkin-send-email" onclick="sendCheckInEmail()">
+        📧 Notify Admin (In)
+      </button>
+      <button class="btn-email hidden" id="checkout-send-email" onclick="sendCheckOutEmail()">
+        📧 Notify Admin (Out)
+      </button>
+    </div>
+
+    <div style="margin-top:18px;background:var(--card);border:1px solid var(--border);border-radius:12px;padding:14px 16px;font-size:13px;color:var(--muted);">
+      💡 After checking in or out, tap <b style="color:var(--amber)">Notify Admin</b> to instantly send a confirmation email to the society office.
+    </div>
+  </div>
+</div>
+
+<!-- ════════════════════════════════════════════════
+     EDIT STAFF MODAL
+════════════════════════════════════════════════ -->
+<div id="edit-modal" class="modal-overlay hidden" onclick="closeEditModal()">
+  <div class="modal-box" onclick="event.stopPropagation()">
+    <div class="modal-title">✏️ Edit Staff Details</div>
+    <input id="edit-id" type="hidden" />
+    <div style="display:flex;flex-direction:column;gap:12px;">
+      <div class="input-group">
+        <label>Full Name</label>
+        <input id="edit-name" type="text" />
+      </div>
+      <div class="input-group">
+        <label>Email (read-only — used for login)</label>
+        <input id="edit-email" type="email" disabled style="opacity:.5;" />
+      </div>
+      <div class="input-group">
+        <label>Designation</label>
+        <input id="edit-desig" type="text" />
+      </div>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;">
+        <div class="input-group">
+          <label>Shift Start</label>
+          <input id="edit-shift-start" type="time" />
+        </div>
+        <div class="input-group">
+          <label>Shift End</label>
+          <input id="edit-shift-end" type="time" />
+        </div>
+      </div>
+    </div>
+    <div class="modal-actions">
+      <button class="btn btn-secondary" onclick="closeEditModal()" style="flex:1;">Cancel</button>
+      <button class="btn btn-primary"   onclick="saveEdit()"       style="flex:1;">Save Changes</button>
+    </div>
+  </div>
+</div>
+
+</body>
+</html>
