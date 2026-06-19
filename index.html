@@ -100,8 +100,8 @@
       setTimeout(()=>{ t.classList.remove("show"); setTimeout(()=>t.remove(),400); },3500);
     }
 
-    function startClock() {
-      const el = $("live-clock");
+    function startClock(elId = "live-clock") {
+      const el = $(elId);
       if (!el) return;
       clockInterval && clearInterval(clockInterval);
       const tick = () => { el.textContent = new Date().toLocaleTimeString("en-IN",{hour:"2-digit",minute:"2-digit",second:"2-digit"}); };
@@ -394,10 +394,11 @@
     async function loadStaffDashboard() {
       showSection("staff-section");
       $("staff-welcome").textContent = staffProfile.name;
+      $("staff-initials").textContent = initials(staffProfile.name);
       $("staff-role").textContent    = staffProfile.designation;
       $("staff-shift").textContent   = `Shift: ${staffProfile.shiftStart} – ${staffProfile.shiftEnd}`;
       $("staff-date").textContent    = todayFull();
-      startClock();
+      startClock("staff-live-clock");
       listenStaffLog();
     }
 
@@ -787,7 +788,7 @@
     </div>
   </nav>
 
-  <div class="section" style="max-width:960px;margin:0 auto;padding:28px 20px;">
+  <div class="inner-wrap" style="max-width:960px;margin:0 auto;padding:28px 20px;">
     <div class="page-title">Admin Dashboard</div>
     <div class="page-sub" id="admin-date"></div>
 
@@ -891,19 +892,18 @@
         </div>
       </div>
       <div class="user-pill">
-        <div id="live-clock-staff" style="display:none"></div>
         <button class="signout-btn" onclick="doSignOut()">Sign out</button>
       </div>
     </div>
   </nav>
 
-  <div class="section" style="max-width:520px;margin:0 auto;padding:28px 20px;">
+  <div class="inner-wrap" style="max-width:520px;margin:0 auto;padding:28px 20px;">
     <div class="staff-hero">
       <div class="big-avatar" id="staff-initials">?</div>
       <div style="font-size:22px;font-weight:800;" id="staff-welcome">Staff</div>
       <div style="color:var(--muted);font-size:13px;" id="staff-role"></div>
       <div style="color:var(--muted);font-size:12px;margin-top:2px;" id="staff-shift"></div>
-      <div class="big-clock" id="live-clock"></div>
+      <div class="big-clock" id="staff-live-clock"></div>
       <div style="font-size:13px;color:var(--muted);" id="staff-date"></div>
     </div>
 
