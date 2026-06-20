@@ -111,23 +111,41 @@
     // ══════════════════════════════════════════════════════════════
     //  AUTH FLOW
     // ══════════════════════════════════════════════════════════════
+    let authRequestToken = 0; // guards against overlapping/late-resolving auth callbacks
+
     onAuthStateChanged(auth, async user => {
-      if (!user) { showSection("auth-section"); return; }
+      const myToken = ++authRequestToken; // this resolution "owns" the UI only if still latest
+
+      // Always tear down previous session's listeners + state first, so nothing stale can render
+      unsubLogs && unsubLogs();  unsubLogs  = null;
+      unsubStaff && unsubStaff(); unsubStaff = null;
+      clockInterval && clearInterval(clockInterval);
+      adminProfile = null; staffProfile = null; role = null;
+
+      if (!user) {
+        if (myToken !== authRequestToken) return;
+        showSection("auth-section");
+        return;
+      }
       currentUser = user;
+
       // Check if admin
       const adminSnap = await getDoc(doc(db,"admins",user.uid));
+      if (myToken !== authRequestToken) return; // a newer auth event has since superseded this one
       if (adminSnap.exists()) {
         adminProfile = adminSnap.data();
         role = "admin";
         loadAdminDashboard();
         return;
       }
-      // Check if staff (matched by email)
+
+      // Check if staff (matched by email — most recently created match wins if duplicated across societies)
       const staffQ = query(collection(db,"staff"), where("email","==",user.email));
       const staffSnap = await getDocs(staffQ);
+      if (myToken !== authRequestToken) return;
       if (!staffSnap.empty) {
-        staffProfile = { id: staffSnap.docs[0].id, ...staffSnap.docs[0].data() };
-        // Store the uid on the staff doc for future logins
+        const docs = staffSnap.docs.sort((a,b) => (b.data().createdAt?.seconds||0) - (a.data().createdAt?.seconds||0));
+        staffProfile = { id: docs[0].id, ...docs[0].data() };
         if (!staffProfile.uid) {
           await updateDoc(doc(db,"staff",staffProfile.id),{ uid: user.uid });
           staffProfile.uid = user.uid;
@@ -136,6 +154,7 @@
         loadStaffDashboard();
         return;
       }
+
       // Unknown user
       showToast("Account not recognised. Contact your society admin.","warn");
       await signOut(auth);
@@ -186,6 +205,11 @@
       unsubStaff && unsubStaff();
       clearInterval(clockInterval);
       adminProfile = staffProfile = role = null;
+      // Clear rendered content immediately so nothing stale flashes for the next login
+      const staffListEl = $("staff-list-admin");
+      if (staffListEl) staffListEl.innerHTML = "";
+      const attBody = $("attendance-tbody");
+      if (attBody) attBody.innerHTML = `<tr><td colspan="7" class="empty-state">Loading…</td></tr>`;
       await signOut(auth);
     };
 
@@ -222,7 +246,8 @@
     function loadStaffList() {
       const listEl = $("staff-list-admin");
       unsubStaff && unsubStaff();
-      unsubStaff = onSnapshot(collection(db,"staff"), snap => {
+      const myStaffQ = query(collection(db,"staff"), where("adminUid","==",currentUser.uid));
+      unsubStaff = onSnapshot(myStaffQ, snap => {
         const staff = snap.docs.map(d=>({id:d.id,...d.data()}));
         renderStaffList(staff, listEl);
         loadTodayAttendance(staff); // refresh attendance table
@@ -260,7 +285,12 @@
       const shiftS  = $("new-shift-start").value;
       const shiftE  = $("new-shift-end").value;
       if (!name||!email||!desig||!shiftS||!shiftE) { showToast("Fill all fields","warn"); return; }
-      const id = email.replace(/[^a-z0-9]/g,"_");
+      // Guard: prevent adding the same email twice within this admin's own staff list
+      const dupQ = query(collection(db,"staff"), where("adminUid","==",currentUser.uid), where("email","==",email));
+      const dupSnap = await getDocs(dupQ);
+      if (!dupSnap.empty) { showToast("A staff member with this email already exists","warn"); return; }
+      // Staff doc ID is namespaced to this admin's uid so two societies never collide
+      const id = currentUser.uid + "_" + email.replace(/[^a-z0-9]/g,"_");
       await setDoc(doc(db,"staff",id),{
         name, email, designation: desig, shiftStart: shiftS, shiftEnd: shiftE,
         adminUid: currentUser.uid, createdAt: serverTimestamp()
@@ -306,14 +336,15 @@
     async function loadTodayAttendance(staffList) {
       const key = dayKey();
       const logsRef = collection(db,"attendance");
-      const q = query(logsRef, where("date","==",key));
+      const q = query(logsRef, where("adminUid","==",currentUser.uid), where("date","==",key));
       unsubLogs && unsubLogs();
       unsubLogs = onSnapshot(q, async snap => {
         const logMap = {};
         snap.docs.forEach(d=>{ logMap[d.data().staffId]=d.data(); });
         // get staff if not passed
         if (!staffList) {
-          const sSnap = await getDocs(collection(db,"staff"));
+          const sQ = query(collection(db,"staff"), where("adminUid","==",currentUser.uid));
+          const sSnap = await getDocs(sQ);
           staffList = sSnap.docs.map(d=>({id:d.id,...d.data()}));
         }
         renderAttendanceTable(staffList, logMap, key);
@@ -366,10 +397,11 @@
 
     // ── Export CSV ────────────────────────────────────────────────
     window.exportCSV = async () => {
-      const sSnap = await getDocs(collection(db,"staff"));
+      const sQ = query(collection(db,"staff"), where("adminUid","==",currentUser.uid));
+      const sSnap = await getDocs(sQ);
       const staff = sSnap.docs.map(d=>({id:d.id,...d.data()}));
       const key   = dayKey();
-      const lQ    = query(collection(db,"attendance"),where("date","==",key));
+      const lQ    = query(collection(db,"attendance"),where("adminUid","==",currentUser.uid),where("date","==",key));
       const lSnap = await getDocs(lQ);
       const logMap={};
       lSnap.docs.forEach(d=>{ logMap[d.data().staffId]=d.data(); });
@@ -505,21 +537,26 @@
     /* ── Reset & Variables ─────────────────────── */
     *, *::before, *::after { box-sizing: border-box; margin:0; padding:0; }
     :root {
-      --bg:       #0F1923;
-      --surface:  #172130;
-      --card:     #1E2D3D;
-      --accent:   #00C9A7;
-      --accent2:  #FF6B6B;
-      --amber:    #FFB347;
-      --text:     #E8EDF2;
-      --muted:    #8FA3B8;
-      --border:   #263547;
-      --radius:   14px;
+      --bg:       #F1EEFB;
+      --surface:  #FFFFFF;
+      --card:     #FFFFFF;
+      --accent:   #6D28D9;
+      --accent-light: #7C3AED;
+      --accent2:  #E94F8A;
+      --teal:     #0D9488;
+      --amber:    #D97706;
+      --text:     #1F1B33;
+      --muted:    #6B6480;
+      --border:   #E4DEF7;
+      --radius:   16px;
       --mono:     'JetBrains Mono','SF Mono',Consolas,monospace;
     }
-    body { background:var(--bg); color:var(--text); font-family:'Inter',system-ui,sans-serif; min-height:100vh; }
+    body {
+      background: linear-gradient(180deg, #ECE7FB 0%, #F4F1FC 40%, #EFEAFA 100%);
+      color:var(--text); font-family:'Inter',system-ui,sans-serif; min-height:100vh;
+    }
     .hidden { display:none !important; }
-    a { color:var(--accent); text-decoration:none; }
+    a { color:var(--accent); text-decoration:none; font-weight:600; }
 
     /* ── Toast ─────────────────────────────────── */
     .toast {
@@ -527,10 +564,10 @@
       background:var(--card); border:1px solid var(--border); color:var(--text);
       padding:12px 20px; border-radius:40px; font-size:13.5px; font-weight:600;
       opacity:0; transition:.3s; z-index:9999; white-space:nowrap;
-      box-shadow:0 8px 32px rgba(0,0,0,.4);
+      box-shadow:0 8px 32px rgba(109,40,217,.18);
     }
     .toast.show { opacity:1; transform:translateX(-50%) translateY(0); }
-    .toast-success { border-color:var(--accent); }
+    .toast-success { border-color:var(--teal); }
     .toast-error   { border-color:var(--accent2); }
     .toast-warn    { border-color:var(--amber); }
 
@@ -556,8 +593,9 @@
       min-height:100vh; padding:20px; gap:0;
     }
     .auth-card {
-      background:var(--surface); border:1px solid var(--border); border-radius:var(--radius);
+      background:var(--surface); border:1px solid var(--border); border-radius:24px;
       padding:36px 32px; width:100%; max-width:420px;
+      box-shadow:0 20px 50px rgba(109,40,217,.12), 0 2px 10px rgba(31,27,51,.06);
     }
     .auth-title { font-size:22px; font-weight:800; margin-bottom:4px; }
     .auth-sub   { font-size:13px; color:var(--muted); margin-bottom:28px; }
@@ -577,7 +615,7 @@
       padding:11px 14px; color:var(--text); font-size:14px; font-family:inherit;
       transition:.2s; outline:none; width:100%;
     }
-    input:focus, select:focus { border-color:var(--accent); box-shadow:0 0 0 3px rgba(0,201,167,.12); }
+    input:focus, select:focus { border-color:var(--accent); box-shadow:0 0 0 3px rgba(109,40,217,.15); }
     input[type="time"] { font-family:var(--mono); }
 
     /* ── Buttons ───────────────────────────────── */
@@ -586,14 +624,14 @@
       font-weight:700; cursor:pointer; display:flex; align-items:center;
       justify-content:center; gap:7px; transition:.2s; width:100%;
     }
-    .btn-primary  { background:var(--accent); color:#0F1923; }
+    .btn-primary  { background:linear-gradient(90deg,#7C3AED,#6D28D9); color:#FFFFFF; box-shadow:0 8px 20px rgba(109,40,217,.3); }
     .btn-primary:hover { filter:brightness(1.1); }
     .btn-secondary{ background:var(--card); color:var(--text); border:1px solid var(--border); }
     .btn-secondary:hover { border-color:var(--accent); }
     .btn-danger   { background:rgba(255,107,107,.15); color:var(--accent2); border:1px solid var(--accent2); }
-    .btn-google   { background:#fff; color:#1B2430; }
+    .btn-google   { background:#fff; color:#1F1B33; }
     .btn-icon     { background:var(--card); border:1px solid var(--border); border-radius:8px; padding:7px 10px; cursor:pointer; font-size:15px; }
-    .btn-edit     { background:rgba(0,201,167,.1); border-color:var(--accent); }
+    .btn-edit     { background:rgba(13,148,136,.1); border-color:var(--teal); color:var(--teal); }
     .btn-del      { background:rgba(255,107,107,.1); border-color:var(--accent2); }
     .btn:disabled { opacity:.4; cursor:not-allowed; }
     .btn-email    { background:rgba(255,179,71,.12); color:var(--amber); border:1px solid var(--amber); border-radius:10px; padding:12px 20px; font-size:14px; font-weight:700; cursor:pointer; display:flex; align-items:center; gap:8px; transition:.2s; }
@@ -604,7 +642,7 @@
     .topnav { background:var(--surface); border-bottom:1px solid var(--border); position:sticky; top:0; z-index:10; }
     .topnav-inner { max-width:960px; margin:0 auto; padding:14px 20px; display:flex; justify-content:space-between; align-items:center; }
     .user-pill { display:flex; align-items:center; gap:8px; }
-    .avatar-sm { width:32px; height:32px; border-radius:50%; background:var(--accent); display:flex; align-items:center; justify-content:center; font-weight:700; font-size:13px; color:#0F1923; }
+    .avatar-sm { width:32px; height:32px; border-radius:50%; background:var(--accent); display:flex; align-items:center; justify-content:center; font-weight:700; font-size:13px; color:#FFFFFF; }
     .signout-btn { background:transparent; border:1px solid var(--border); border-radius:8px; padding:7px 12px; color:var(--muted); font-size:13px; cursor:pointer; transition:.2s; }
     .signout-btn:hover { border-color:var(--accent2); color:var(--accent2); }
 
@@ -614,22 +652,22 @@
       border:1px solid var(--border); background:var(--surface); color:var(--muted);
       border-radius:9px; padding:9px 18px; font-size:13px; font-weight:600; cursor:pointer; transition:.2s;
     }
-    .admin-tab-btn.active { background:var(--accent); color:#0F1923; border-color:var(--accent); }
+    .admin-tab-btn.active { background:linear-gradient(90deg,#7C3AED,#6D28D9); color:#FFFFFF; border-color:transparent; box-shadow:0 6px 16px rgba(109,40,217,.25); }
 
     /* ── Summary cards ─────────────────────────── */
     .summary-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr)); gap:12px; margin-bottom:24px; }
     .summary-card {
       background:var(--card); border:1px solid var(--border); border-radius:var(--radius);
-      padding:16px 18px;
+      padding:16px 18px; box-shadow:0 4px 16px rgba(31,27,51,.05);
     }
     .summary-label { font-size:11px; font-weight:700; color:var(--muted); text-transform:uppercase; letter-spacing:.05em; margin-bottom:8px; }
     .summary-value { font-family:var(--mono); font-size:32px; font-weight:700; }
-    .summary-value.green { color:var(--accent); }
+    .summary-value.green { color:var(--teal); }
     .summary-value.amber { color:var(--amber); }
     .summary-value.red   { color:var(--accent2); }
 
     /* ── Attendance table ──────────────────────── */
-    .table-wrap { background:var(--card); border:1px solid var(--border); border-radius:var(--radius); overflow:auto; }
+    .table-wrap { background:var(--card); border:1px solid var(--border); border-radius:var(--radius); overflow:auto; box-shadow:0 4px 20px rgba(31,27,51,.05); }
     table { width:100%; border-collapse:collapse; font-size:13.5px; }
     th { text-align:left; padding:12px 16px; font-size:11px; font-weight:700; color:var(--muted); text-transform:uppercase; letter-spacing:.04em; border-bottom:1px solid var(--border); white-space:nowrap; }
     td { padding:13px 16px; border-bottom:1px solid var(--border); vertical-align:middle; }
@@ -639,17 +677,18 @@
     .status-badge { font-size:12px; font-weight:600; padding:4px 10px; border-radius:6px; }
     .status-absent      { background:rgba(255,107,107,.12); color:var(--accent2); }
     .status-checked-in  { background:rgba(255,179,71,.15);  color:var(--amber); }
-    .status-completed   { background:rgba(0,201,167,.12);   color:var(--accent); }
+    .status-completed   { background:rgba(13,148,136,.12);   color:var(--teal); }
 
     /* ── Staff cards ───────────────────────────── */
     .staff-card {
       background:var(--card); border:1px solid var(--border); border-radius:var(--radius);
       padding:16px; display:flex; align-items:center; gap:14px; margin-bottom:10px;
+      box-shadow:0 3px 14px rgba(31,27,51,.04);
     }
     .staff-avatar {
       width:44px; height:44px; border-radius:50%; background:var(--accent);
       display:flex; align-items:center; justify-content:center;
-      font-weight:800; font-size:15px; color:#0F1923; flex-shrink:0;
+      font-weight:800; font-size:15px; color:#FFFFFF; flex-shrink:0;
     }
     .staff-info  { flex:1; }
     .staff-name  { font-weight:700; font-size:15px; }
@@ -673,7 +712,7 @@
     .big-avatar {
       width:70px; height:70px; border-radius:50%; background:var(--accent);
       display:flex; align-items:center; justify-content:center;
-      font-weight:800; font-size:26px; color:#0F1923; margin:0 auto 14px;
+      font-weight:800; font-size:26px; color:#FFFFFF; margin:0 auto 14px;
     }
     .big-clock { font-family:var(--mono); font-size:42px; font-weight:700; color:var(--accent); margin:10px 0; }
     .time-grid { display:grid; grid-template-columns:1fr 1fr; gap:14px; margin:24px 0; }
@@ -689,7 +728,7 @@
 
     /* ── Modal ─────────────────────────────────── */
     .modal-overlay {
-      position:fixed; inset:0; background:rgba(15,25,35,.75);
+      position:fixed; inset:0; background:rgba(31,27,51,.55);
       display:flex; align-items:center; justify-content:center; padding:20px; z-index:200;
     }
     .modal-box {
@@ -714,9 +753,22 @@
 ════════════════════════════════════════════════ -->
 <div id="auth-section" class="section">
   <div style="text-align:center;margin-bottom:32px;">
-    <div style="width:56px;height:56px;border-radius:16px;background:var(--accent);display:flex;align-items:center;justify-content:center;font-size:28px;margin:0 auto 12px;">🏢</div>
-    <div style="font-size:24px;font-weight:800;">Society Attendance</div>
-    <div style="color:var(--muted);font-size:13px;margin-top:4px;">Secure staff attendance management</div>
+    <div style="display:inline-flex;align-items:center;gap:10px;background:linear-gradient(90deg,#7C3AED,#0D9488);padding:10px 22px;border-radius:999px;box-shadow:0 10px 26px rgba(109,40,217,.25);margin-bottom:22px;">
+      <span style="font-size:18px;">🏢</span>
+      <span style="color:#fff;font-weight:800;font-size:13px;letter-spacing:.06em;">SOCIETY ATTENDANCE PORTAL</span>
+    </div>
+    <div style="font-size:30px;font-weight:800;line-height:1.15;background:linear-gradient(90deg,#6D28D9,#E94F8A);-webkit-background-clip:text;background-clip:text;color:transparent;">
+      Track Every<br/>Check-In, Instantly
+    </div>
+    <div style="color:var(--muted);font-size:13.5px;margin-top:10px;max-width:320px;margin-left:auto;margin-right:auto;">
+      Digital attendance management for housing societies — simple, transparent, real-time.
+    </div>
+    <div style="display:flex;flex-wrap:wrap;justify-content:center;gap:8px;margin-top:20px;">
+      <span style="background:#EDE9FE;color:#6D28D9;font-weight:700;font-size:12.5px;padding:7px 14px;border-radius:999px;">⏱️ Live Clock-In</span>
+      <span style="background:#CCFBF1;color:#0D9488;font-weight:700;font-size:12.5px;padding:7px 14px;border-radius:999px;">📊 Daily Records</span>
+      <span style="background:#FCE7F3;color:#BE185D;font-weight:700;font-size:12.5px;padding:7px 14px;border-radius:999px;">📁 Excel Export</span>
+      <span style="background:#FEF3C7;color:#B45309;font-weight:700;font-size:12.5px;padding:7px 14px;border-radius:999px;">🔒 Secure Login</span>
+    </div>
   </div>
 
   <div class="auth-card">
@@ -748,7 +800,7 @@
 
     <!-- Register tab -->
     <div id="tab-register" class="auth-tab-panel hidden">
-      <div style="background:rgba(0,201,167,.08);border:1px solid rgba(0,201,167,.2);border-radius:10px;padding:12px 14px;font-size:13px;color:var(--muted);margin-bottom:4px;">
+      <div style="background:rgba(109,40,217,.06);border:1px solid rgba(109,40,217,.18);border-radius:10px;padding:12px 14px;font-size:13px;color:var(--muted);margin-bottom:4px;">
         🔒 Register a new <b style="color:var(--text)">Society Admin</b> account. Staff members do NOT register here — admin adds them.
       </div>
       <div class="input-group">
@@ -798,7 +850,7 @@
     </div>
 
     <!-- Attendance panel -->
-    <div id="admin-panel-attendance">
+    <div id="admin-panel-attendance" class="admin-panel">
       <div class="summary-grid">
         <div class="summary-card">
           <div class="summary-label">Total Staff</div>
@@ -839,7 +891,7 @@
     </div>
 
     <!-- Staff panel -->
-    <div id="admin-panel-staff" class="hidden">
+    <div id="admin-panel-staff" class="admin-panel hidden">
       <div class="add-form">
         <h3>➕ Add New Staff Member</h3>
         <div class="form-row">
