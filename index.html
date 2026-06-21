@@ -260,14 +260,14 @@
         return;
       }
       container.innerHTML = staff.map(s => `
-        <div class="staff-card">
+        <div class="staff-card staff-card-clickable" onclick="openStaffHistory('${s.id}','${esc(s.name)}','${esc(s.designation)}')">
           <div class="staff-avatar">${initials(s.name)}</div>
           <div class="staff-info">
             <div class="staff-name">${s.name}</div>
             <div class="staff-meta">${s.designation} · ${s.email}</div>
             <div class="staff-meta">Shift: ${s.shiftStart} – ${s.shiftEnd}</div>
           </div>
-          <div class="staff-actions">
+          <div class="staff-actions" onclick="event.stopPropagation()">
             <button class="btn-icon btn-edit" onclick="editStaff('${s.id}','${esc(s.name)}','${esc(s.email)}','${esc(s.designation)}','${s.shiftStart}','${s.shiftEnd}')">✏️</button>
             <button class="btn-icon btn-del" onclick="deleteStaff('${s.id}','${esc(s.name)}')">🗑</button>
           </div>
@@ -330,6 +330,109 @@
       const { deleteDoc } = await import("https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js");
       await deleteDoc(doc(db,"staff",id));
       showToast(`${name} removed`,"info");
+    };
+
+    // ── Staff attendance history modal ──────────────────────────────
+    let historyStaffId = null;
+    let historyStaffName = null;
+
+    function defaultRange() {
+      const to = new Date();
+      const from = new Date();
+      from.setDate(from.getDate() - 6); // last 7 days by default
+      return { from: dayKey(from), to: dayKey(to) };
+    }
+
+    window.openStaffHistory = (id, name, designation) => {
+      historyStaffId = id;
+      historyStaffName = name;
+      $("history-staff-name").textContent = name;
+      $("history-staff-desig").textContent = designation;
+      $("history-staff-initials").textContent = initials(name);
+      const range = defaultRange();
+      $("history-from").value = range.from;
+      $("history-to").value = range.to;
+      $("history-modal").classList.remove("hidden");
+      loadStaffHistory();
+    };
+
+    window.closeHistoryModal = () => {
+      $("history-modal").classList.add("hidden");
+      historyStaffId = null;
+    };
+
+    window.loadStaffHistory = async () => {
+      if (!historyStaffId) return;
+      const from = $("history-from").value;
+      const to   = $("history-to").value;
+      if (!from || !to) { showToast("Pick both From and To dates","warn"); return; }
+      if (from > to) { showToast("'From' date must be before 'To' date","warn"); return; }
+
+      const tbody = $("history-tbody");
+      tbody.innerHTML = `<tr><td colspan="5" class="empty-state">Loading…</td></tr>`;
+
+      const hq = query(
+        collection(db,"attendance"),
+        where("adminUid","==",currentUser.uid),
+        where("staffId","==",historyStaffId),
+        where("date",">=",from),
+        where("date","<=",to),
+        orderBy("date","desc")
+      );
+      const snap = await getDocs(hq);
+      const rows = snap.docs.map(d => d.data());
+      renderStaffHistoryTable(rows);
+    };
+
+    function renderStaffHistoryTable(rows) {
+      const tbody = $("history-tbody");
+      if (!rows.length) {
+        tbody.innerHTML = `<tr><td colspan="5" class="empty-state">No attendance records in this range</td></tr>`;
+        return;
+      }
+      tbody.innerHTML = rows.map(r => {
+        const inTime  = r.checkIn  ? fmt12(r.checkIn)  : "—";
+        const outTime = r.checkOut ? fmt12(r.checkOut) : "—";
+        const dur = r.checkIn && r.checkOut ? getDuration(r.checkIn, r.checkOut) : "—";
+        const status = !r.checkIn ? "Absent" : !r.checkOut ? "Checked In" : "Completed";
+        return `<tr>
+          <td class="mono">${r.date}</td>
+          <td class="mono">${inTime}</td>
+          <td class="mono">${outTime}</td>
+          <td class="mono">${dur}</td>
+          <td><span class="status-badge status-${status.toLowerCase().replace(" ","-")}">${status}</span></td>
+        </tr>`;
+      }).join("");
+    }
+
+    window.exportStaffHistoryCSV = async () => {
+      const from = $("history-from").value;
+      const to   = $("history-to").value;
+      if (!from || !to) { showToast("Pick both From and To dates","warn"); return; }
+      if (from > to) { showToast("'From' date must be before 'To' date","warn"); return; }
+
+      const hq = query(
+        collection(db,"attendance"),
+        where("adminUid","==",currentUser.uid),
+        where("staffId","==",historyStaffId),
+        where("date",">=",from),
+        where("date","<=",to),
+        orderBy("date","desc")
+      );
+      const snap = await getDocs(hq);
+      const rows = [["Date","Name","Check In","Check Out","Hours","Status"]];
+      snap.docs.forEach(d => {
+        const r = d.data();
+        const dur = r.checkIn && r.checkOut ? getDuration(r.checkIn, r.checkOut) : "";
+        const status = !r.checkIn ? "Absent" : !r.checkOut ? "Checked In" : "Completed";
+        rows.push([r.date, historyStaffName,
+          r.checkIn?fmt12(r.checkIn):"", r.checkOut?fmt12(r.checkOut):"", dur, status]);
+      });
+      const csv = rows.map(r=>r.map(v=>`"${v}"`).join(",")).join("\n");
+      const a = document.createElement("a");
+      a.href = "data:text/csv;charset=utf-8,"+encodeURIComponent(csv);
+      a.download = `${historyStaffName.replace(/\s+/g,"_")}_${from}_to_${to}.csv`;
+      a.click();
     };
 
     // ── Today attendance (admin) ──────────────────────────────────
@@ -734,9 +837,17 @@
     .modal-box {
       background:var(--surface); border:1px solid var(--border); border-radius:var(--radius);
       padding:28px; width:100%; max-width:440px;
+      box-shadow:0 24px 60px rgba(31,27,51,.18);
     }
     .modal-title { font-size:17px; font-weight:800; margin-bottom:20px; }
     .modal-actions { display:flex; gap:10px; margin-top:20px; }
+
+    /* ── Staff history modal ───────────────────── */
+    .history-box { max-width:620px; }
+    .history-range-row { display:grid; grid-template-columns:1fr 1fr auto auto; gap:10px; align-items:end; }
+    @media(max-width:560px) { .history-range-row { grid-template-columns:1fr 1fr; } }
+    .staff-card-clickable { cursor:pointer; transition:transform .15s ease, box-shadow .15s ease; }
+    .staff-card-clickable:hover { transform:translateY(-2px); box-shadow:0 10px 26px rgba(109,40,217,.12); border-color:#D8CCF7; }
 
     /* ── Misc ──────────────────────────────────── */
     .empty-state { padding:40px; text-align:center; color:var(--muted); font-size:14px; }
@@ -823,7 +934,7 @@
 <!-- ════════════════════════════════════════════════
      ADMIN DASHBOARD
 ════════════════════════════════════════════════ -->
-<div id="admin-section" class="hidden">
+<div id="admin-section" class="section hidden">
   <nav class="topnav">
     <div class="topnav-inner">
       <div class="logo">
@@ -934,7 +1045,7 @@
 <!-- ════════════════════════════════════════════════
      STAFF DASHBOARD
 ════════════════════════════════════════════════ -->
-<div id="staff-section" class="hidden">
+<div id="staff-section" class="section hidden">
   <nav class="topnav">
     <div class="topnav-inner">
       <div class="logo">
@@ -1027,6 +1138,49 @@
     </div>
   </div>
 </div>
+
+<!-- ════════════════════════════════════════════════
+     STAFF ATTENDANCE HISTORY MODAL
+════════════════════════════════════════════════ -->
+<div id="history-modal" class="modal-overlay hidden" onclick="closeHistoryModal()">
+  <div class="modal-box history-box" onclick="event.stopPropagation()">
+    <div style="display:flex;align-items:center;gap:12px;margin-bottom:18px;">
+      <div class="staff-avatar" id="history-staff-initials" style="width:40px;height:40px;font-size:13px;">?</div>
+      <div style="flex:1;">
+        <div style="font-weight:800;font-size:16px;" id="history-staff-name">Staff</div>
+        <div style="font-size:12.5px;color:var(--muted);" id="history-staff-desig"></div>
+      </div>
+      <button class="btn-icon" onclick="closeHistoryModal()" style="border:none;background:transparent;font-size:18px;">✕</button>
+    </div>
+
+    <div class="history-range-row">
+      <div class="input-group">
+        <label>From</label>
+        <input id="history-from" type="date" />
+      </div>
+      <div class="input-group">
+        <label>To</label>
+        <input id="history-to" type="date" />
+      </div>
+      <button class="btn btn-secondary" style="width:auto;padding:11px 16px;" onclick="loadStaffHistory()">🔍 Filter</button>
+      <button class="btn btn-primary" style="width:auto;padding:11px 16px;" onclick="exportStaffHistoryCSV()">⬇ Export</button>
+    </div>
+
+    <div class="table-wrap" style="margin-top:16px;max-height:340px;overflow-y:auto;">
+      <table>
+        <thead>
+          <tr>
+            <th>Date</th><th>Check In</th><th>Check Out</th><th>Hours</th><th>Status</th>
+          </tr>
+        </thead>
+        <tbody id="history-tbody">
+          <tr><td colspan="5" class="empty-state">Loading…</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+</div>
+
 
 </body>
 </html>
