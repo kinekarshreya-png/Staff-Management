@@ -371,17 +371,24 @@
       const tbody = $("history-tbody");
       tbody.innerHTML = `<tr><td colspan="5" class="empty-state">Loading…</td></tr>`;
 
-      const hq = query(
-        collection(db,"attendance"),
-        where("adminUid","==",currentUser.uid),
-        where("staffId","==",historyStaffId),
-        where("date",">=",from),
-        where("date","<=",to),
-        orderBy("date","desc")
-      );
-      const snap = await getDocs(hq);
-      const rows = snap.docs.map(d => d.data());
-      renderStaffHistoryTable(rows);
+      try {
+        // Filter only by staffId server-side (single-field, no index needed),
+        // then filter the date range client-side to avoid requiring a Firestore composite index.
+        const hq = query(
+          collection(db,"attendance"),
+          where("staffId","==",historyStaffId)
+        );
+        const snap = await getDocs(hq);
+        const rows = snap.docs
+          .map(d => d.data())
+          .filter(r => r.adminUid === currentUser.uid && r.date >= from && r.date <= to)
+          .sort((a,b) => b.date.localeCompare(a.date));
+        renderStaffHistoryTable(rows);
+      } catch (e) {
+        console.error(e);
+        tbody.innerHTML = `<tr><td colspan="5" class="empty-state">Couldn't load history: ${e.message}</td></tr>`;
+        showToast("Failed to load history","error");
+      }
     };
 
     function renderStaffHistoryTable(rows) {
@@ -411,28 +418,34 @@
       if (!from || !to) { showToast("Pick both From and To dates","warn"); return; }
       if (from > to) { showToast("'From' date must be before 'To' date","warn"); return; }
 
-      const hq = query(
-        collection(db,"attendance"),
-        where("adminUid","==",currentUser.uid),
-        where("staffId","==",historyStaffId),
-        where("date",">=",from),
-        where("date","<=",to),
-        orderBy("date","desc")
-      );
-      const snap = await getDocs(hq);
-      const rows = [["Date","Name","Check In","Check Out","Hours","Status"]];
-      snap.docs.forEach(d => {
-        const r = d.data();
-        const dur = r.checkIn && r.checkOut ? getDuration(r.checkIn, r.checkOut) : "";
-        const status = !r.checkIn ? "Absent" : !r.checkOut ? "Checked In" : "Completed";
-        rows.push([r.date, historyStaffName,
-          r.checkIn?fmt12(r.checkIn):"", r.checkOut?fmt12(r.checkOut):"", dur, status]);
-      });
-      const csv = rows.map(r=>r.map(v=>`"${v}"`).join(",")).join("\n");
-      const a = document.createElement("a");
-      a.href = "data:text/csv;charset=utf-8,"+encodeURIComponent(csv);
-      a.download = `${historyStaffName.replace(/\s+/g,"_")}_${from}_to_${to}.csv`;
-      a.click();
+      try {
+        const hq = query(
+          collection(db,"attendance"),
+          where("staffId","==",historyStaffId)
+        );
+        const snap = await getDocs(hq);
+        const rows = [["Date","Name","Check In","Check Out","Hours","Status"]];
+        snap.docs
+          .map(d => d.data())
+          .filter(r => r.adminUid === currentUser.uid && r.date >= from && r.date <= to)
+          .sort((a,b) => b.date.localeCompare(a.date))
+          .forEach(r => {
+            const dur = r.checkIn && r.checkOut ? getDuration(r.checkIn, r.checkOut) : "";
+            const status = !r.checkIn ? "Absent" : !r.checkOut ? "Checked In" : "Completed";
+            rows.push([r.date, historyStaffName,
+              r.checkIn?fmt12(r.checkIn):"", r.checkOut?fmt12(r.checkOut):"", dur, status]);
+          });
+        if (rows.length === 1) { showToast("No records to export in this range","warn"); return; }
+        const csv = rows.map(r=>r.map(v=>`"${v}"`).join(",")).join("\n");
+        const a = document.createElement("a");
+        a.href = "data:text/csv;charset=utf-8,"+encodeURIComponent(csv);
+        a.download = `${historyStaffName.replace(/\s+/g,"_")}_${from}_to_${to}.csv`;
+        a.click();
+        showToast("CSV exported","success");
+      } catch (e) {
+        console.error(e);
+        showToast("Export failed: "+e.message,"error");
+      }
     };
 
     // ── Today attendance (admin) ──────────────────────────────────
@@ -535,6 +548,53 @@
       $("staff-date").textContent    = todayFull();
       startClock("staff-live-clock");
       listenStaffLog();
+      loadStaffSociety();
+      loadMyHistory();
+    }
+
+    async function loadStaffSociety() {
+      if (!staffProfile.adminUid) return;
+      const snap = await getDoc(doc(db,"admins",staffProfile.adminUid));
+      $("staff-society-name").textContent = snap.exists() ? snap.data().society : "Your Society";
+    }
+
+    // ── Staff's own attendance history (read-only, last 14 days by default) ──
+    async function loadMyHistory() {
+      const listEl = $("my-history-list");
+      if (!listEl) return;
+      listEl.innerHTML = `<div class="empty-state">Loading…</div>`;
+      try {
+        const hq = query(collection(db,"attendance"), where("staffId","==",staffProfile.id));
+        const snap = await getDocs(hq);
+        const rows = snap.docs
+          .map(d => d.data())
+          .sort((a,b) => b.date.localeCompare(a.date))
+          .slice(0, 14);
+        renderMyHistory(rows);
+      } catch (e) {
+        console.error(e);
+        listEl.innerHTML = `<div class="empty-state">Couldn't load history</div>`;
+      }
+    }
+
+    function renderMyHistory(rows) {
+      const listEl = $("my-history-list");
+      if (!rows.length) {
+        listEl.innerHTML = `<div class="empty-state">No attendance records yet</div>`;
+        return;
+      }
+      listEl.innerHTML = rows.map(r => {
+        const inTime  = r.checkIn  ? fmt12(r.checkIn)  : "—";
+        const outTime = r.checkOut ? fmt12(r.checkOut) : "—";
+        const dur = r.checkIn && r.checkOut ? getDuration(r.checkIn, r.checkOut) : "—";
+        const status = !r.checkIn ? "Absent" : !r.checkOut ? "Checked In" : "Completed";
+        return `<div class="history-row">
+          <div class="history-row-date">${r.date}</div>
+          <div class="history-row-times"><span class="mono">${inTime}</span> → <span class="mono">${outTime}</span></div>
+          <div class="history-row-hours mono">${dur}</div>
+          <span class="status-badge status-${status.toLowerCase().replace(" ","-")}">${status}</span>
+        </div>`;
+      }).join("");
     }
 
     function listenStaffLog() {
@@ -556,22 +616,58 @@
       if (!log.checkIn) {
         inBtn.disabled  = false;
         outBtn.disabled = true;
-        $("checkin-send-email").classList.add("hidden");
-        $("checkout-send-email").classList.add("hidden");
       } else if (!log.checkOut) {
         inBtn.disabled  = true;
         outBtn.disabled = false;
-        $("checkin-send-email").classList.remove("hidden");
-        $("checkout-send-email").classList.add("hidden");
       } else {
         inBtn.disabled  = true;
         outBtn.disabled = true;
-        $("checkin-send-email").classList.remove("hidden");
-        $("checkout-send-email").classList.remove("hidden");
       }
     }
 
-    window.doCheckIn = async () => {
+    // ── Confirm modal for check-in / check-out ──────────────────────
+    let pendingAction = null; // "in" | "out"
+
+    window.askConfirmCheckIn  = () => openConfirmModal("in");
+    window.askConfirmCheckOut = () => openConfirmModal("out");
+
+    function openConfirmModal(action) {
+      pendingAction = action;
+      const now = new Date();
+      $("confirm-action-title").textContent = action === "in" ? "Confirm Entry" : "Confirm Exit";
+      $("confirm-action-desc").textContent  = action === "in"
+        ? "You're about to mark your check-in time as:"
+        : "You're about to mark your check-out time as:";
+      $("confirm-action-time").textContent = now.toLocaleTimeString("en-IN",{hour:"2-digit",minute:"2-digit",second:"2-digit"});
+      $("confirm-action-btn").textContent = action === "in" ? "✅ Confirm Entry" : "🏁 Confirm Exit";
+      $("confirm-action-btn").className = "btn " + (action === "in" ? "btn-primary" : "btn-danger");
+      $("confirm-action-modal").classList.remove("hidden");
+    }
+
+    window.closeConfirmModal = () => {
+      $("confirm-action-modal").classList.add("hidden");
+      pendingAction = null;
+    };
+
+    window.confirmAction = async () => {
+      if (!pendingAction) return;
+      const action = pendingAction;
+      const btn = $("confirm-action-btn");
+      btn.disabled = true;
+      btn.textContent = "Saving…";
+      try {
+        if (action === "in") await doCheckIn();
+        else await doCheckOut();
+        // Auto-notify admin immediately — no separate button needed
+        await notifyAdmin(action);
+      } finally {
+        btn.disabled = false;
+        closeConfirmModal();
+        loadMyHistory();
+      }
+    };
+
+    async function doCheckIn() {
       const key   = dayKey();
       const now   = new Date().toISOString();
       const logId = `${staffProfile.id}_${key}`;
@@ -585,15 +681,15 @@
         adminUid: staffProfile.adminUid,
       },{merge:true});
       showToast("✅ Checked in at "+fmt12(now),"success");
-    };
+    }
 
-    window.doCheckOut = async () => {
+    async function doCheckOut() {
       const key   = dayKey();
       const now   = new Date().toISOString();
       const logId = `${staffProfile.id}_${key}`;
       await updateDoc(doc(db,"attendance",logId),{ checkOut: now });
       showToast("🏁 Checked out at "+fmt12(now),"info");
-    };
+    }
 
     async function getAdminEmail() {
       if (!staffProfile.adminUid) return null;
@@ -601,39 +697,22 @@
       return snap.exists() ? snap.data().email : null;
     }
 
-    window.sendCheckInEmail = async () => {
-      const key   = dayKey();
-      const snap  = await getDoc(doc(db,"attendance",`${staffProfile.id}_${key}`));
-      if (!snap.exists()) { showToast("No check-in record found","warn"); return; }
-      const log = snap.data();
-      const adminEmail = await getAdminEmail();
-      if (!adminEmail) { showToast("Admin email not found","warn"); return; }
-      const adminSnap = await getDoc(doc(db,"admins",staffProfile.adminUid));
-      const societyName = adminSnap.exists() ? adminSnap.data().society : "Society";
-      $("checkin-send-email").disabled = true;
-      await sendEmailNotification({
-        staffName: staffProfile.name, staffEmail: staffProfile.email,
-        action:"in", time: fmt12(log.checkIn), adminEmail, societyName
-      });
-      $("checkin-send-email").disabled = false;
-    };
-
-    window.sendCheckOutEmail = async () => {
+    // Automatically notifies the admin right after a confirmed check-in/out — no manual button needed.
+    async function notifyAdmin(action) {
       const key  = dayKey();
       const snap = await getDoc(doc(db,"attendance",`${staffProfile.id}_${key}`));
-      if (!snap.exists()) { showToast("No log found","warn"); return; }
+      if (!snap.exists()) return;
       const log = snap.data();
       const adminEmail = await getAdminEmail();
-      if (!adminEmail) { showToast("Admin email not found","warn"); return; }
-      const adminSnap  = await getDoc(doc(db,"admins",staffProfile.adminUid));
-      const societyName= adminSnap.exists() ? adminSnap.data().society : "Society";
-      $("checkout-send-email").disabled = true;
+      if (!adminEmail) { showToast("Admin email not found — couldn't send notification","warn"); return; }
+      const adminSnap   = await getDoc(doc(db,"admins",staffProfile.adminUid));
+      const societyName = adminSnap.exists() ? adminSnap.data().society : "Society";
+      const time = action === "in" ? log.checkIn : log.checkOut;
       await sendEmailNotification({
         staffName: staffProfile.name, staffEmail: staffProfile.email,
-        action:"out", time: fmt12(log.checkOut), adminEmail, societyName
+        action, time: fmt12(time), adminEmail, societyName
       });
-      $("checkout-send-email").disabled = false;
-    };
+    }
   </script>
 
   <style>
@@ -846,6 +925,21 @@
     .history-box { max-width:620px; }
     .history-range-row { display:grid; grid-template-columns:1fr 1fr auto auto; gap:10px; align-items:end; }
     @media(max-width:560px) { .history-range-row { grid-template-columns:1fr 1fr; } }
+
+    /* ── Staff's own history list ──────────────── */
+    .history-list { display:flex; flex-direction:column; gap:8px; margin-top:6px; }
+    .history-row {
+      background:var(--card); border:1px solid var(--border); border-radius:12px;
+      padding:12px 14px; display:flex; align-items:center; gap:12px;
+      box-shadow:0 2px 10px rgba(31,27,51,.04);
+    }
+    .history-row-date { font-weight:700; font-size:13px; min-width:88px; }
+    .history-row-times { font-size:12.5px; color:var(--muted); flex:1; }
+    .history-row-hours { font-size:12.5px; color:var(--muted); min-width:60px; }
+    @media(max-width:420px) {
+      .history-row { flex-wrap:wrap; }
+      .history-row-date { min-width:100%; }
+    }
     .staff-card-clickable { cursor:pointer; transition:transform .15s ease, box-shadow .15s ease; }
     .staff-card-clickable:hover { transform:translateY(-2px); box-shadow:0 10px 26px rgba(109,40,217,.12); border-color:#D8CCF7; }
 
@@ -1051,7 +1145,8 @@
       <div class="logo">
         <div class="logo-mark">👤</div>
         <div>
-          <div class="logo-text">My Attendance</div>
+          <div class="logo-text" id="staff-society-name">My Attendance</div>
+          <div class="logo-sub">Staff Portal</div>
         </div>
       </div>
       <div class="user-pill">
@@ -1082,21 +1177,17 @@
     </div>
 
     <div class="action-row">
-      <button class="btn btn-primary" id="btn-checkin" onclick="doCheckIn()">✅ Check In</button>
-      <button class="btn btn-danger"  id="btn-checkout" onclick="doCheckOut()" disabled>🏁 Check Out</button>
+      <button class="btn btn-primary" id="btn-checkin" onclick="askConfirmCheckIn()">✅ Check In</button>
+      <button class="btn btn-danger"  id="btn-checkout" onclick="askConfirmCheckOut()" disabled>🏁 Check Out</button>
     </div>
 
-    <div class="email-row">
-      <button class="btn-email hidden" id="checkin-send-email" onclick="sendCheckInEmail()">
-        📧 Notify Admin (In)
-      </button>
-      <button class="btn-email hidden" id="checkout-send-email" onclick="sendCheckOutEmail()">
-        📧 Notify Admin (Out)
-      </button>
+    <div style="margin-top:14px;background:var(--card);border:1px solid var(--border);border-radius:12px;padding:14px 16px;font-size:13px;color:var(--muted);">
+      💡 Each check-in/out asks you to confirm first, then automatically emails the society office — no extra steps needed.
     </div>
 
-    <div style="margin-top:18px;background:var(--card);border:1px solid var(--border);border-radius:12px;padding:14px 16px;font-size:13px;color:var(--muted);">
-      💡 After checking in or out, tap <b style="color:var(--amber)">Notify Admin</b> to instantly send a confirmation email to the society office.
+    <div class="section-title" style="margin-top:28px;">📅 My Recent Attendance</div>
+    <div id="my-history-list" class="history-list">
+      <div class="empty-state">Loading…</div>
     </div>
   </div>
 </div>
@@ -1156,13 +1247,13 @@
     <div class="history-range-row">
       <div class="input-group">
         <label>From</label>
-        <input id="history-from" type="date" />
+        <input id="history-from" type="date" onchange="loadStaffHistory()" />
       </div>
       <div class="input-group">
         <label>To</label>
-        <input id="history-to" type="date" />
+        <input id="history-to" type="date" onchange="loadStaffHistory()" />
       </div>
-      <button class="btn btn-secondary" style="width:auto;padding:11px 16px;" onclick="loadStaffHistory()">🔍 Filter</button>
+      <button class="btn btn-secondary" style="width:auto;padding:11px 16px;" onclick="loadStaffHistory()">🔍 Search</button>
       <button class="btn btn-primary" style="width:auto;padding:11px 16px;" onclick="exportStaffHistoryCSV()">⬇ Export</button>
     </div>
 
@@ -1181,6 +1272,23 @@
   </div>
 </div>
 
+<!-- ════════════════════════════════════════════════
+     CHECK-IN / CHECK-OUT CONFIRM MODAL (staff)
+════════════════════════════════════════════════ -->
+<div id="confirm-action-modal" class="modal-overlay hidden" onclick="closeConfirmModal()">
+  <div class="modal-box" onclick="event.stopPropagation()" style="text-align:center;">
+    <div id="confirm-action-title" class="modal-title" style="margin-bottom:6px;">Confirm Entry</div>
+    <div id="confirm-action-desc" style="font-size:13.5px;color:var(--muted);margin-bottom:14px;"></div>
+    <div id="confirm-action-time" class="big-clock" style="font-size:30px;margin:0 0 22px;"></div>
+    <div style="display:flex;gap:10px;">
+      <button class="btn btn-secondary" onclick="closeConfirmModal()" style="flex:1;">Cancel</button>
+      <button id="confirm-action-btn" class="btn btn-primary" onclick="confirmAction()" style="flex:1.4;">✅ Confirm Entry</button>
+    </div>
+    <div style="margin-top:14px;font-size:12px;color:var(--muted);">
+      📧 This will also notify your society admin automatically.
+    </div>
+  </div>
+</div>
 
 </body>
 </html>
