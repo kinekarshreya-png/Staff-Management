@@ -1,1319 +1,696 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Society Attendance Manager</title>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1.0"/>
+<title>Society Attendance Portal</title>
+<script type="module">
+import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-app.js";
+import { getAuth, GoogleAuthProvider, signInWithPopup, createUserWithEmailAndPassword,
+  signInWithEmailAndPassword, sendPasswordResetEmail, signOut, onAuthStateChanged
+} from "https://www.gstatic.com/firebasejs/10.12.2/firebase-auth.js";
+import { getFirestore, collection, doc, setDoc, getDoc, getDocs, updateDoc, deleteDoc,
+  onSnapshot, serverTimestamp, query, where, arrayUnion
+} from "https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js";
 
-  <!-- Firebase SDKs -->
-  <script type="module">
-    // ============================================================
-    // CONFIGURATION — replace with your own Firebase project values
-    // ============================================================
-    import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-app.js";
-    import {
-      getAuth, GoogleAuthProvider, signInWithPopup, createUserWithEmailAndPassword,
-      signInWithEmailAndPassword, sendPasswordResetEmail, signOut, onAuthStateChanged
-    } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-auth.js";
-    import {
-      getFirestore, collection, doc, setDoc, getDoc, getDocs, updateDoc,
-      onSnapshot, serverTimestamp, query, where, orderBy, arrayUnion
-    } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js";
+// ─── YOUR CREDENTIALS ────────────────────────────────────────────────────────
+const firebaseConfig = {
+  apiKey:            "AIzaSyB2sw1RGACABcDkzJhViZOBN4cwfw0WXp0",
+  authDomain:        "society-attendance.firebaseapp.com",
+  projectId:         "society-attendance",
+  storageBucket:     "society-attendance.firebasestorage.app",
+  messagingSenderId: "913422861145",
+  appId:             "1:913422861145:web:3fb37fdb4e314167ad0248"
+};
+const EMAILJS_SERVICE_ID  = "service_b1mllxr";
+const EMAILJS_TEMPLATE_ID = "template_q9jbgne";
+const EMAILJS_PUBLIC_KEY  = "wRVjKCC0cwQz6Trdt";
+// ─────────────────────────────────────────────────────────────────────────────
 
-    const firebaseConfig = {
-      apiKey:            "AIzaSyB2sw1RGACABcDkzJhViZOBN4cwfw0WXp0",
-      authDomain:        "society-attendance.firebaseapp.com",
-      projectId:         "society-attendance",
-      storageBucket:     "society-attendance.firebasestorage.app",
-      messagingSenderId: "913422861145",
-      appId:             "1:913422861145:web:3fb37fdb4e314167ad0248"
-    };
+const app  = initializeApp(firebaseConfig);
+const auth = getAuth(app);
+const db   = getFirestore(app);
 
-    // EmailJS config — sign up at https://www.emailjs.com (free tier)
-    const EMAILJS_SERVICE_ID  = "service_b1mllxr";
-    const EMAILJS_TEMPLATE_ID = "template_q9jbgne";
-    const EMAILJS_PUBLIC_KEY  = "wRVjKCC0cwQz6Trdt";
+// ── tiny helpers ──────────────────────────────────────────────────────────────
+const pad     = n => String(n).padStart(2,"0");
+const dayKey  = (d=new Date()) => `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}`;
+const fmt12   = iso => { if(!iso) return "—"; const d=new Date(iso); let h=d.getHours(),m=d.getMinutes(),ap=h>=12?"PM":"AM"; h=h%12||12; return `${h}:${pad(m)} ${ap}`; };
+const todayFull = () => new Date().toLocaleDateString("en-IN",{weekday:"long",year:"numeric",month:"long",day:"numeric"});
+const initials  = n => (n||"?").split(" ").map(p=>p[0]).slice(0,2).join("").toUpperCase();
+const esc       = v => (v||"").replace(/'/g,"\\'");
+const $ = id => document.getElementById(id);
 
-    // ============================================================
-    const app  = initializeApp(firebaseConfig);
-    const auth = getAuth(app);
-    const db   = getFirestore(app);
+// ── multi-entry helpers ───────────────────────────────────────────────────────
+const getEntries    = log => (log&&log.entries&&log.entries.length) ? log.entries : [];
+const lastEntry     = log => { const e=getEntries(log); return e.length?e[e.length-1]:null; };
+const canCheckIn    = log => { const l=lastEntry(log); return !l||l.out!==null; };
+const canCheckOut   = log => { const l=lastEntry(log); return l&&l.out===null; };
+const firstIn       = log => { const e=getEntries(log); return e.length?e[0].in:null; };
+const totalMins     = log => getEntries(log).reduce((s,e)=>{ if(!e.in||!e.out) return s; return s+Math.max(0,Math.round((new Date(e.out)-new Date(e.in))/60000)); },0);
+const fmtHours      = log => { const m=totalMins(log); if(!m) return "—"; return `${Math.floor(m/60)}h ${pad(m%60)}m`; };
+const getDuration   = (a,b) => { const m=Math.max(0,Math.round((new Date(b)-new Date(a))/60000)); return `${Math.floor(m/60)}h ${pad(m%60)}m`; };
+const isLate        = (log,shift) => { const fi=firstIn(log); if(!fi||!shift) return false; const d=new Date(fi),[sh,sm]=shift.split(":").map(Number); return (d.getHours()*60+d.getMinutes())>(sh*60+sm); };
+const entryLines    = log => getEntries(log).map((e,i)=>`${i+1}. ${fmt12(e.in)} → ${e.out?fmt12(e.out):"now"}`).join(" | ");
 
-    // ── helpers ──────────────────────────────────────────────────
-    const pad  = n => String(n).padStart(2,"0");
-    const dayKey = (d = new Date()) => `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}`;
-    const fmt12  = iso => { const d=new Date(iso); let h=d.getHours(),m=d.getMinutes(),ap=h>=12?"PM":"AM"; h=h%12||12; return `${h}:${pad(m)} ${ap}`; };
-    const todayFull = () => new Date().toLocaleDateString("en-IN",{weekday:"long",year:"numeric",month:"long",day:"numeric"});
+// ── state ─────────────────────────────────────────────────────────────────────
+let currentUser=null, adminProfile=null, staffProfile=null, role=null;
+let unsubLogs=null, unsubStaff=null, clockInterval=null, authToken=0;
 
-    // ── state ─────────────────────────────────────────────────────
-    let currentUser   = null;   // Firebase user
-    let adminProfile  = null;   // Firestore /admins/{uid}
-    let staffProfile  = null;   // Firestore /staff/{uid}
-    let role          = null;   // "admin" | "staff"
-    let unsubLogs     = null;
-    let unsubStaff    = null;
-    let clockInterval = null;
-
-    // ── EmailJS loader ────────────────────────────────────────────
-    function loadEmailJS() {
-      return new Promise(resolve => {
-        if (window.emailjs) { resolve(); return; }
-        const s = document.createElement("script");
-        s.src = "https://cdn.jsdelivr.net/npm/@emailjs/browser@4/dist/email.min.js";
-        s.onload = () => { emailjs.init(EMAILJS_PUBLIC_KEY); resolve(); };
-        document.head.appendChild(s);
-      });
-    }
-
-    async function sendEmailNotification({staffName, staffEmail, action, time, adminEmail, societyName}) {
-      try {
-        await loadEmailJS();
-        await emailjs.send(EMAILJS_SERVICE_ID, EMAILJS_TEMPLATE_ID, {
-          to_email:    adminEmail,
-          from_name:   societyName || "Society Office",
-          staff_name:  staffName,
-          staff_email: staffEmail,
-          action:      action === "in" ? "Checked IN" : "Checked OUT",
-          time:        time,
-          date:        new Date().toLocaleDateString("en-IN"),
-        });
-        showToast("✅ Notification sent to admin email","success");
-      } catch(e) {
-        showToast("⚠️ Email send failed – check EmailJS config","warn");
-        console.error(e);
-      }
-    }
-
-    // ── UI helpers ────────────────────────────────────────────────
-    const $ = id => document.getElementById(id);
-    const showSection = id => {
-      document.querySelectorAll(".section").forEach(s => s.classList.add("hidden"));
-      $(id).classList.remove("hidden");
-    };
-
-    function showToast(msg, type="info") {
-      const t = document.createElement("div");
-      t.className = `toast toast-${type}`;
-      t.textContent = msg;
-      document.body.appendChild(t);
-      setTimeout(()=>t.classList.add("show"),10);
-      setTimeout(()=>{ t.classList.remove("show"); setTimeout(()=>t.remove(),400); },3500);
-    }
-
-    function startClock(elId = "live-clock") {
-      const el = $(elId);
-      if (!el) return;
-      clockInterval && clearInterval(clockInterval);
-      const tick = () => { el.textContent = new Date().toLocaleTimeString("en-IN",{hour:"2-digit",minute:"2-digit",second:"2-digit"}); };
-      tick(); clockInterval = setInterval(tick, 1000);
-    }
-
-    // ══════════════════════════════════════════════════════════════
-    //  AUTH FLOW
-    // ══════════════════════════════════════════════════════════════
-    let authRequestToken = 0; // guards against overlapping/late-resolving auth callbacks
-
-    onAuthStateChanged(auth, async user => {
-      const myToken = ++authRequestToken; // this resolution "owns" the UI only if still latest
-
-      // Always tear down previous session's listeners + state first, so nothing stale can render
-      unsubLogs && unsubLogs();  unsubLogs  = null;
-      unsubStaff && unsubStaff(); unsubStaff = null;
-      clockInterval && clearInterval(clockInterval);
-      adminProfile = null; staffProfile = null; role = null;
-
-      if (!user) {
-        if (myToken !== authRequestToken) return;
-        showSection("auth-section");
-        return;
-      }
-      currentUser = user;
-
-      // Check if admin
-      const adminSnap = await getDoc(doc(db,"admins",user.uid));
-      if (myToken !== authRequestToken) return; // a newer auth event has since superseded this one
-      if (adminSnap.exists()) {
-        adminProfile = adminSnap.data();
-        role = "admin";
-        loadAdminDashboard();
-        return;
-      }
-
-      // Check if staff (matched by email — most recently created match wins if duplicated across societies)
-      const staffQ = query(collection(db,"staff"), where("email","==",user.email));
-      const staffSnap = await getDocs(staffQ);
-      if (myToken !== authRequestToken) return;
-      if (!staffSnap.empty) {
-        const docs = staffSnap.docs.sort((a,b) => (b.data().createdAt?.seconds||0) - (a.data().createdAt?.seconds||0));
-        staffProfile = { id: docs[0].id, ...docs[0].data() };
-        if (!staffProfile.uid) {
-          await updateDoc(doc(db,"staff",staffProfile.id),{ uid: user.uid });
-          staffProfile.uid = user.uid;
-        }
-        role = "staff";
-        loadStaffDashboard();
-        return;
-      }
-
-      // Unknown user
-      showToast("Account not recognised. Contact your society admin.","warn");
-      await signOut(auth);
+// ── EmailJS ───────────────────────────────────────────────────────────────────
+function loadEmailJS() {
+  return new Promise(resolve => {
+    if(window.emailjs){resolve();return;}
+    const s=document.createElement("script");
+    s.src="https://cdn.jsdelivr.net/npm/@emailjs/browser@4/dist/email.min.js";
+    s.onload=()=>{emailjs.init(EMAILJS_PUBLIC_KEY);resolve();};
+    document.head.appendChild(s);
+  });
+}
+async function sendEmail({staffName,staffEmail,action,time,adminEmail,societyName}) {
+  try {
+    await loadEmailJS();
+    await emailjs.send(EMAILJS_SERVICE_ID,EMAILJS_TEMPLATE_ID,{
+      to_email:adminEmail, from_name:societyName||"Society",
+      staff_name:staffName, staff_email:staffEmail,
+      action:action==="in"?"Checked IN":"Checked OUT", time, date:new Date().toLocaleDateString("en-IN")
     });
-
-    // ── Google Sign-In ────────────────────────────────────────────
-    window.googleSignIn = async () => {
-      try {
-        await signInWithPopup(auth, new GoogleAuthProvider());
-      } catch(e) { showToast(e.message,"error"); }
-    };
-
-    // ── Admin register ────────────────────────────────────────────
-    window.adminRegister = async () => {
-      const email   = $("reg-email").value.trim();
-      const pass    = $("reg-pass").value;
-      const society = $("reg-society").value.trim();
-      if (!email||!pass||!society) { showToast("Fill all fields","warn"); return; }
-      try {
-        const cred = await createUserWithEmailAndPassword(auth, email, pass);
-        await setDoc(doc(db,"admins",cred.user.uid),{
-          email, society, createdAt: serverTimestamp()
-        });
-        showToast("Admin account created!","success");
-      } catch(e) { showToast(e.message,"error"); }
-    };
-
-    // ── Admin login ────────────────────────────────────────────────
-    window.adminLogin = async () => {
-      const email = $("login-email").value.trim();
-      const pass  = $("login-pass").value;
-      try {
-        await signInWithEmailAndPassword(auth, email, pass);
-      } catch(e) { showToast(e.message,"error"); }
-    };
-
-    // ── Forgot password ───────────────────────────────────────────
-    window.forgotPassword = async () => {
-      const email = $("login-email").value.trim();
-      if (!email) { showToast("Enter your email first","warn"); return; }
-      await sendPasswordResetEmail(auth, email);
-      showToast("Password reset link sent to "+email,"success");
-    };
-
-    // ── Sign out ──────────────────────────────────────────────────
-    window.doSignOut = async () => {
-      unsubLogs && unsubLogs();
-      unsubStaff && unsubStaff();
-      clearInterval(clockInterval);
-      adminProfile = staffProfile = role = null;
-      // Clear rendered content immediately so nothing stale flashes for the next login
-      const staffListEl = $("staff-list-admin");
-      if (staffListEl) staffListEl.innerHTML = "";
-      const attBody = $("attendance-tbody");
-      if (attBody) attBody.innerHTML = `<tr><td colspan="7" class="empty-state">Loading…</td></tr>`;
-      await signOut(auth);
-    };
-
-    // ── Toggle auth tabs ──────────────────────────────────────────
-    window.showTab = tab => {
-      document.querySelectorAll(".auth-tab-panel").forEach(p=>p.classList.add("hidden"));
-      document.querySelectorAll(".tab-btn").forEach(b=>b.classList.remove("active"));
-      $(`tab-${tab}`).classList.remove("hidden");
-      document.querySelector(`[data-tab="${tab}"]`).classList.add("active");
-    };
-
-    // ══════════════════════════════════════════════════════════════
-    //  ADMIN DASHBOARD
-    // ══════════════════════════════════════════════════════════════
-    function loadAdminDashboard() {
-      showSection("admin-section");
-      $("admin-society").textContent = adminProfile.society;
-      $("admin-email-display").textContent = adminProfile.email;
-      $("admin-date").textContent = todayFull();
-      startClock();
-      loadStaffList();
-      loadTodayAttendance();
-      showAdminTab("attendance");
-    }
-
-    window.showAdminTab = tab => {
-      document.querySelectorAll(".admin-panel").forEach(p=>p.classList.add("hidden"));
-      document.querySelectorAll(".admin-tab-btn").forEach(b=>b.classList.remove("active"));
-      $(`admin-panel-${tab}`).classList.remove("hidden");
-      document.querySelector(`[data-admin-tab="${tab}"]`).classList.add("active");
-    };
-
-    // ── Staff list (admin) ────────────────────────────────────────
-    function loadStaffList() {
-      const listEl = $("staff-list-admin");
-      unsubStaff && unsubStaff();
-      const myStaffQ = query(collection(db,"staff"), where("adminUid","==",currentUser.uid));
-      unsubStaff = onSnapshot(myStaffQ, snap => {
-        const staff = snap.docs.map(d=>({id:d.id,...d.data()}));
-        renderStaffList(staff, listEl);
-        loadTodayAttendance(staff); // refresh attendance table
-      });
-    }
-
-    function renderStaffList(staff, container) {
-      if (!staff.length) {
-        container.innerHTML = `<div class="empty-state">No staff added yet. Use the form above to add your first staff member.</div>`;
-        return;
-      }
-      container.innerHTML = staff.map(s => `
-        <div class="staff-card staff-card-clickable" onclick="openStaffHistory('${s.id}','${esc(s.name)}','${esc(s.designation)}')">
-          <div class="staff-avatar">${initials(s.name)}</div>
-          <div class="staff-info">
-            <div class="staff-name">${s.name}</div>
-            <div class="staff-meta">${s.designation} · ${s.email}</div>
-            <div class="staff-meta">Shift: ${s.shiftStart} – ${s.shiftEnd}</div>
-          </div>
-          <div class="staff-actions" onclick="event.stopPropagation()">
-            <button class="btn-icon btn-edit" onclick="editStaff('${s.id}','${esc(s.name)}','${esc(s.email)}','${esc(s.designation)}','${s.shiftStart}','${s.shiftEnd}')">✏️</button>
-            <button class="btn-icon btn-del" onclick="deleteStaff('${s.id}','${esc(s.name)}')">🗑</button>
-          </div>
-        </div>`).join("");
-    }
-
-    const esc = v => (v||"").replace(/'/g,"\\'");
-    const initials = name => (name||"?").split(" ").map(p=>p[0]).slice(0,2).join("").toUpperCase();
-
-    // ── Add staff ─────────────────────────────────────────────────
-    window.addStaff = async () => {
-      const name    = $("new-name").value.trim();
-      const email   = $("new-email").value.trim().toLowerCase();
-      const desig   = $("new-desig").value.trim();
-      const shiftS  = $("new-shift-start").value;
-      const shiftE  = $("new-shift-end").value;
-      if (!name||!email||!desig||!shiftS||!shiftE) { showToast("Fill all fields","warn"); return; }
-      // Guard: prevent adding the same email twice within this admin's own staff list
-      const dupQ = query(collection(db,"staff"), where("adminUid","==",currentUser.uid), where("email","==",email));
-      const dupSnap = await getDocs(dupQ);
-      if (!dupSnap.empty) { showToast("A staff member with this email already exists","warn"); return; }
-      // Staff doc ID is namespaced to this admin's uid so two societies never collide
-      const id = currentUser.uid + "_" + email.replace(/[^a-z0-9]/g,"_");
-      await setDoc(doc(db,"staff",id),{
-        name, email, designation: desig, shiftStart: shiftS, shiftEnd: shiftE,
-        adminUid: currentUser.uid, createdAt: serverTimestamp()
-      });
-      ["new-name","new-email","new-desig","new-shift-start","new-shift-end"].forEach(f=>$(f).value="");
-      showToast(`${name} added. They can now log in with ${email}.`,"success");
-    };
-
-    // ── Edit staff ────────────────────────────────────────────────
-    window.editStaff = (id,name,email,desig,shiftS,shiftE) => {
-      const modal = $("edit-modal");
-      $("edit-id").value    = id;
-      $("edit-name").value  = name;
-      $("edit-email").value = email;
-      $("edit-desig").value = desig;
-      $("edit-shift-start").value = shiftS;
-      $("edit-shift-end").value   = shiftE;
-      modal.classList.remove("hidden");
-    };
-
-    window.saveEdit = async () => {
-      const id    = $("edit-id").value;
-      const name  = $("edit-name").value.trim();
-      const desig = $("edit-desig").value.trim();
-      const shiftS= $("edit-shift-start").value;
-      const shiftE= $("edit-shift-end").value;
-      await updateDoc(doc(db,"staff",id),{name,designation:desig,shiftStart:shiftS,shiftEnd:shiftE});
-      $("edit-modal").classList.add("hidden");
-      showToast("Staff details updated","success");
-    };
-
-    window.closeEditModal = () => $("edit-modal").classList.add("hidden");
-
-    // ── Delete staff ──────────────────────────────────────────────
-    window.deleteStaff = async (id,name) => {
-      if (!confirm(`Remove ${name} from the system?`)) return;
-      const { deleteDoc } = await import("https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js");
-      await deleteDoc(doc(db,"staff",id));
-      showToast(`${name} removed`,"info");
-    };
-
-    // ── Staff attendance history modal ──────────────────────────────
-    let historyStaffId = null;
-    let historyStaffName = null;
-
-    function defaultRange() {
-      const to = new Date();
-      const from = new Date();
-      from.setDate(from.getDate() - 6); // last 7 days by default
-      return { from: dayKey(from), to: dayKey(to) };
-    }
-
-    window.openStaffHistory = (id, name, designation) => {
-      historyStaffId = id;
-      historyStaffName = name;
-      $("history-staff-name").textContent = name;
-      $("history-staff-desig").textContent = designation;
-      $("history-staff-initials").textContent = initials(name);
-      const range = defaultRange();
-      $("history-from").value = range.from;
-      $("history-to").value = range.to;
-      $("history-modal").classList.remove("hidden");
-      loadStaffHistory();
-    };
-
-    window.closeHistoryModal = () => {
-      $("history-modal").classList.add("hidden");
-      historyStaffId = null;
-    };
-
-    window.loadStaffHistory = async () => {
-      if (!historyStaffId) return;
-      const from = $("history-from").value;
-      const to   = $("history-to").value;
-      if (!from || !to) { showToast("Pick both From and To dates","warn"); return; }
-      if (from > to) { showToast("'From' date must be before 'To' date","warn"); return; }
-
-      const tbody = $("history-tbody");
-      tbody.innerHTML = `<tr><td colspan="4" class="empty-state">Loading…</td></tr>`;
-
-      try {
-        // Filter only by staffId server-side (single-field, no index needed),
-        // then filter the date range client-side to avoid requiring a Firestore composite index.
-        const hq = query(
-          collection(db,"attendance"),
-          where("staffId","==",historyStaffId)
-        );
-        const snap = await getDocs(hq);
-        const rows = snap.docs
-          .map(d => d.data())
-          .filter(r => r.adminUid === currentUser.uid && r.date >= from && r.date <= to)
-          .sort((a,b) => b.date.localeCompare(a.date));
-        renderStaffHistoryTable(rows);
-      } catch (e) {
-        console.error(e);
-        tbody.innerHTML = `<tr><td colspan="4" class="empty-state">Couldn't load history: ${e.message}</td></tr>`;
-        showToast("Failed to load history","error");
-      }
-    };
-
-    // ── Multi-entry helpers ───────────────────────────────────────
-    // Each attendance doc now stores entries: [{in: iso, out: iso|null}, ...]
-    // A new Check In adds a new entry; Check Out fills out on the last entry.
-    const getEntries    = log => (log && log.entries && log.entries.length) ? log.entries : [];
-    const lastEntry     = log => { const e = getEntries(log); return e.length ? e[e.length-1] : null; };
-    const canCheckIn    = log => { const l = lastEntry(log); return !l || l.out !== null; };
-    const canCheckOut   = log => { const l = lastEntry(log); return l && l.out === null; };
-    const firstIn       = log => { const e = getEntries(log); return e.length ? e[0].in : null; };
-    const totalMins     = log => getEntries(log).reduce((sum,e) => {
-      if (!e.in || !e.out) return sum;
-      return sum + Math.max(0, Math.round((new Date(e.out) - new Date(e.in)) / 60000));
-    }, 0);
-    const fmtTotalHours = log => {
-      const m = totalMins(log);
-      if (!m) return "—";
-      return `${Math.floor(m/60)}h ${pad(m%60)}m`;
-    };
-    const entryLines = log => getEntries(log)
-      .map((e,i) => `${i+1}. ${e.in ? fmt12(e.in) : "—"} → ${e.out ? fmt12(e.out) : "in progress"}`)
-      .join(" | ");
-
-    function isLate(log, shiftStart) {
-      const fin = firstIn(log);
-      if (!fin || !shiftStart) return false;
-      const d=new Date(fin), [sh,sm]=shiftStart.split(":").map(Number);
-      return (d.getHours()*60+d.getMinutes()) > (sh*60+sm);
-    }
-
-    function getDuration(inIso, outIso) {
-      const mins = Math.round((new Date(outIso)-new Date(inIso))/60000);
-      return `${Math.floor(mins/60)}h ${pad(mins%60)}m`;
-    }
-
-    // ── Render admin attendance table (multi-entry aware) ─────────
-    function renderAttendanceTable(staff, logMap, date) {
-      const tbody = $("attendance-tbody");
-      if (!staff.length) { tbody.innerHTML=`<tr><td colspan="7" class="empty-state">No staff yet</td></tr>`; return; }
-      tbody.innerHTML = staff.map(s => {
-        const log = logMap[s.id] || {};
-        const entries = getEntries(log);
-        const fin  = firstIn(log);
-        const late = isLate(log, s.shiftStart);
-        const hrs  = fmtTotalHours(log);
-        const hasAnyIn = entries.length > 0;
-        const allDone  = hasAnyIn && entries.every(e => e.out);
-        const status   = !hasAnyIn ? "Absent" : allDone ? "Completed" : "Checked In";
-        // Show entries compactly
-        const entryHtml = entries.length
-          ? entries.map((e,i)=>
-              `<div style="font-size:11.5px;font-family:var(--mono);color:var(--muted);">
-                ${i+1}. ${fmt12(e.in)} → ${e.out?fmt12(e.out):'<b style="color:var(--teal)">now</b>'}
-              </div>`).join("")
-          : `<span style="color:var(--muted)">—</span>`;
-        return `<tr>
-          <td><b>${s.name}</b>${late?`<span class="late-badge">Late</span>`:""}
-          </td>
-          <td style="font-size:12.5px;">${s.designation}</td>
-          <td class="mono" style="font-size:12px;">${s.shiftStart}</td>
-          <td style="min-width:160px;">${entryHtml}</td>
-          <td class="mono">${hrs}</td>
-          <td><span class="status-badge status-${status.toLowerCase().replace(" ","-")}">${status}</span></td>
-        </tr>`;
-      }).join("");
-    }
-
-    function renderSummaryCards(staff, logMap) {
-      const present = staff.filter(s => getEntries(logMap[s.id]||{}).length > 0).length;
-      const late    = staff.filter(s => {
-        const log = logMap[s.id]||{};
-        return getEntries(log).length > 0 && isLate(log, s.shiftStart);
-      }).length;
-      const absent  = staff.length - present;
-      $("card-total").textContent   = staff.length;
-      $("card-present").textContent = present;
-      $("card-late").textContent    = late;
-      $("card-absent").textContent  = absent;
-    }
-
-    // ── Admin today CSV export (multi-entry aware) ─────────────────
-    window.exportCSV = async () => {
-      const sQ = query(collection(db,"staff"), where("adminUid","==",currentUser.uid));
-      const sSnap = await getDocs(sQ);
-      const staff = sSnap.docs.map(d=>({id:d.id,...d.data()}));
-      const key   = dayKey();
-      const lQ    = query(collection(db,"attendance"),where("adminUid","==",currentUser.uid),where("date","==",key));
-      const lSnap = await getDocs(lQ);
-      const logMap={};
-      lSnap.docs.forEach(d=>{ logMap[d.data().staffId]=d.data(); });
-      const rows = [["Date","Name","Designation","Shift","Entries","Total Hours","Status","Late"]];
-      staff.forEach(s=>{
-        const log = logMap[s.id] || {};
-        const entries = getEntries(log);
-        const status  = !entries.length ? "Absent" : entries.every(e=>e.out) ? "Completed" : "Checked In";
-        rows.push([key, s.name, s.designation||"", s.shiftStart,
-          entryLines(log), fmtTotalHours(log), status,
-          entries.length && isLate(log, s.shiftStart) ? "Yes" : "No"]);
-      });
-      const csv=rows.map(r=>r.map(v=>`"${v}"`).join(",")).join("\n");
-      const a=document.createElement("a");
-      a.href="data:text/csv;charset=utf-8,"+encodeURIComponent(csv);
-      a.download=`attendance_${key}.csv`; a.click();
-      showToast("CSV exported","success");
-    };
-
-    // ── Staff history table (admin clicks staff card) ──────────────
-    function renderStaffHistoryTable(rows) {
-      const tbody = $("history-tbody");
-      if (!rows.length) {
-        tbody.innerHTML = `<tr><td colspan="4" class="empty-state">No attendance records in this range</td></tr>`;
-        return;
-      }
-      tbody.innerHTML = rows.map(r => {
-        const entries = getEntries(r);
-        const hrs  = fmtTotalHours(r);
-        const status = !entries.length ? "Absent" : entries.every(e=>e.out) ? "Completed" : "Checked In";
-        const entryHtml = entries.length
-          ? entries.map((e,i)=>
-              `<div style="font-size:11.5px;font-family:var(--mono);">
-                ${i+1}. ${fmt12(e.in)} → ${e.out?fmt12(e.out):'in progress'}
-              </div>`).join("")
-          : "—";
-        return `<tr>
-          <td class="mono">${r.date}</td>
-          <td>${entryHtml}</td>
-          <td class="mono">${hrs}</td>
-          <td><span class="status-badge status-${status.toLowerCase().replace(" ","-")}">${status}</span></td>
-        </tr>`;
-      }).join("");
-    }
-
-    // ── Admin per-staff CSV export (multi-entry aware) ─────────────
-    window.exportStaffHistoryCSV = async () => {
-      const from = $("history-from").value;
-      const to   = $("history-to").value;
-      if (!from || !to) { showToast("Pick both From and To dates","warn"); return; }
-      if (from > to)    { showToast("'From' must be before 'To'","warn"); return; }
-      try {
-        const hq = query(collection(db,"attendance"), where("staffId","==",historyStaffId));
-        const snap = await getDocs(hq);
-        const filteredDocs = snap.docs
-          .map(d => d.data())
-          .filter(r => r.adminUid === currentUser.uid && r.date >= from && r.date <= to)
-          .sort((a,b) => b.date.localeCompare(a.date));
-        if (!filteredDocs.length) { showToast("No records to export in this range","warn"); return; }
-        // One row per entry-pair within each day
-        const rows = [["Date","Name","Entry#","Check In","Check Out","Hours","Status"]];
-        filteredDocs.forEach(r => {
-          const entries = getEntries(r);
-          if (!entries.length) {
-            rows.push([r.date, historyStaffName, "—","—","—","—","Absent"]);
-          } else {
-            entries.forEach((e,i) => {
-              const dur = e.in && e.out ? getDuration(e.in, e.out) : "";
-              const status = !e.out ? "Checked In" : "Completed";
-              rows.push([r.date, historyStaffName, i+1,
-                e.in?fmt12(e.in):"", e.out?fmt12(e.out):"", dur, status]);
-            });
-          }
-        });
-        const csv = rows.map(r=>r.map(v=>`"${v}"`).join(",")).join("\n");
-        const a = document.createElement("a");
-        a.href = "data:text/csv;charset=utf-8,"+encodeURIComponent(csv);
-        a.download = `${historyStaffName.replace(/\s+/g,"_")}_${from}_to_${to}.csv`;
-        a.click();
-        showToast("CSV exported","success");
-      } catch(e) {
-        console.error(e);
-        showToast("Export failed: "+e.message,"error");
-      }
-    };
-
-    // ── Staff own history render (multi-entry aware) ───────────────
-    function renderMyHistory(rows) {
-      const listEl = $("my-history-list");
-      if (!rows.length) {
-        listEl.innerHTML = `<div class="empty-state">No attendance records yet</div>`;
-        return;
-      }
-      listEl.innerHTML = rows.map(r => {
-        const entries = getEntries(r);
-        const hrs  = fmtTotalHours(r);
-        const status = !entries.length ? "Absent" : entries.every(e=>e.out) ? "Completed" : "Checked In";
-        const entryHtml = entries.length
-          ? entries.map((e,i) =>
-              `<div class="mono" style="font-size:11.5px;">${i+1}. ${fmt12(e.in)} → ${e.out?fmt12(e.out):'<b style="color:var(--teal)">now</b>'}</div>`
-            ).join("")
-          : `<span class="mono" style="font-size:12px;">—</span>`;
-        return `<div class="history-row">
-          <div style="flex:1;min-width:0;">
-            <div class="history-row-date">${r.date}</div>
-            <div style="margin-top:4px;">${entryHtml}</div>
-          </div>
-          <div style="text-align:right;">
-            <div class="history-row-hours mono" style="font-size:13px;font-weight:700;margin-bottom:5px;">${hrs}</div>
-            <span class="status-badge status-${status.toLowerCase().replace(" ","-")}">${status}</span>
-          </div>
-        </div>`;
-      }).join("");
-    }
-
-    // ── Staff my-history CSV export ─────────────────────────────────
-    window.exportMyHistoryCSV = async () => {
-      const listEl = $("my-history-list");
-      listEl && listEl.querySelectorAll('.empty-state');
-      try {
-        const hq = query(collection(db,"attendance"), where("staffId","==",staffProfile.id));
-        const snap = await getDocs(hq);
-        const sorted = snap.docs
-          .map(d => d.data())
-          .sort((a,b) => b.date.localeCompare(a.date));
-        if (!sorted.length) { showToast("No records to export","warn"); return; }
-        const rows = [["Date","Entry#","Check In","Check Out","Hours","Status","Society"]];
-        // Get society name for the export
-        const adminSnap = staffProfile.adminUid
-          ? await getDoc(doc(db,"admins",staffProfile.adminUid)) : null;
-        const society = adminSnap?.exists() ? adminSnap.data().society : "";
-        sorted.forEach(r => {
-          const entries = getEntries(r);
-          if (!entries.length) {
-            rows.push([r.date,"—","—","—","—","Absent",society]);
-          } else {
-            entries.forEach((e,i) => {
-              const dur = e.in && e.out ? getDuration(e.in, e.out) : "";
-              rows.push([r.date, i+1, e.in?fmt12(e.in):"", e.out?fmt12(e.out):"",
-                dur, !e.out?"Checked In":"Completed", society]);
-            });
-          }
-        });
-        const csv = rows.map(r=>r.map(v=>`"${v}"`).join(",")).join("\n");
-        const a = document.createElement("a");
-        a.href = "data:text/csv;charset=utf-8,"+encodeURIComponent(csv);
-        a.download = `my_attendance_${staffProfile.name.replace(/\s+/g,"_")}.csv`;
-        a.click();
-        showToast("Your attendance exported","success");
-      } catch(e) {
-        console.error(e);
-        showToast("Export failed: "+e.message,"error");
-      }
-    };
-
-    // ── listenStaffLog (multi-entry aware) ────────────────────────
-    function listenStaffLog() {
-      const key = dayKey();
-      const logRef = doc(db,"attendance",`${staffProfile.id}_${key}`);
-      onSnapshot(logRef, snap => {
-        const data = snap.exists() ? snap.data() : {};
-        updateStaffUI(data);
-      });
-    }
-
-    // ── updateStaffUI (multi-entry aware) ─────────────────────────
-    function updateStaffUI(log) {
-      const inBtn  = $("btn-checkin");
-      const outBtn = $("btn-checkout");
-      const entries = getEntries(log);
-      const last = lastEntry(log);
-
-      // Today's entry summary
-      const inEl  = $("display-in");
-      const outEl = $("display-out");
-      if (entries.length) {
-        inEl.textContent  = fmt12(entries[0].in);
-        outEl.textContent = last.out ? fmt12(last.out) : "In progress";
-        // Show all pairs if multiple
-        const todayEl = $("today-entries");
-        if (todayEl) {
-          todayEl.innerHTML = entries.map((e,i)=>
-            `<div class="mono" style="font-size:12px;color:var(--muted);">
-              ${i+1}. ${fmt12(e.in)} → ${e.out?fmt12(e.out):'<b style="color:var(--teal)">now</b>'}
-            </div>`).join("");
-          todayEl.style.display = "block";
-        }
-      } else {
-        inEl.textContent  = "—";
-        outEl.textContent = "—";
-        const todayEl = $("today-entries");
-        if (todayEl) todayEl.style.display = "none";
-      }
-
-      inBtn.disabled  = !canCheckIn(log);
-      outBtn.disabled = !canCheckOut(log);
-    }
-
-    // ── Confirm modal for check-in / check-out ────────────────────
-    let pendingAction = null;
-
-    window.askConfirmCheckIn  = () => openConfirmModal("in");
-    window.askConfirmCheckOut = () => openConfirmModal("out");
-
-    function openConfirmModal(action) {
-      pendingAction = action;
-      const now = new Date();
-      $("confirm-action-title").textContent = action === "in" ? "Confirm Entry" : "Confirm Exit";
-      $("confirm-action-desc").textContent  = action === "in"
-        ? "You're about to mark your check-in time as:"
-        : "You're about to mark your check-out time as:";
-      $("confirm-action-time").textContent = now.toLocaleTimeString("en-IN",{hour:"2-digit",minute:"2-digit",second:"2-digit"});
-      $("confirm-action-btn").textContent = action === "in" ? "✅ Confirm Entry" : "🏁 Confirm Exit";
-      $("confirm-action-btn").className = "btn " + (action === "in" ? "btn-primary" : "btn-danger");
-      $("confirm-action-modal").classList.remove("hidden");
-    }
-
-    window.closeConfirmModal = () => {
-      $("confirm-action-modal").classList.add("hidden");
-      pendingAction = null;
-    };
-
-    window.confirmAction = async () => {
-      if (!pendingAction) return;
-      const action = pendingAction;
-      const btn = $("confirm-action-btn");
-      btn.disabled = true;
-      btn.textContent = "Saving…";
-      try {
-        if (action === "in") await doCheckIn();
-        else await doCheckOut();
-        await notifyAdmin(action);
-      } finally {
-        btn.disabled = false;
-        closeConfirmModal();
-        loadMyHistory();
-      }
-    };
-
-    // ── doCheckIn: appends a new {in, out:null} entry ─────────────
-    async function doCheckIn() {
-      const key   = dayKey();
-      const now   = new Date().toISOString();
-      const logId = `${staffProfile.id}_${key}`;
-      const newEntry = { in: now, out: null };
-      // setDoc with merge creates the doc if missing; arrayUnion appends the new entry
-      await setDoc(doc(db,"attendance",logId), {
-        staffId:    staffProfile.id,
-        staffName:  staffProfile.name,
-        staffEmail: staffProfile.email,
-        date:       key,
-        adminUid:   staffProfile.adminUid,
-        entries:    arrayUnion(newEntry),
-      }, { merge: true });
-      showToast("✅ Checked in at "+fmt12(now),"success");
-    }
-
-    // ── doCheckOut: fills out on the last open entry ──────────────
-    async function doCheckOut() {
-      const key   = dayKey();
-      const now   = new Date().toISOString();
-      const logId = `${staffProfile.id}_${key}`;
-      // Read the doc, find the last open entry, replace it with out filled
-      const snap = await getDoc(doc(db,"attendance",logId));
-      if (!snap.exists()) { showToast("No check-in found for today","warn"); return; }
-      const data    = snap.data();
-      const entries = [...(data.entries || [])];
-      const idx     = entries.map(e => e.out).lastIndexOf(null);
-      if (idx === -1) { showToast("No open check-in to close","warn"); return; }
-      entries[idx] = { ...entries[idx], out: now };
-      await updateDoc(doc(db,"attendance",logId), { entries });
-      showToast("🏁 Checked out at "+fmt12(now),"info");
-    }
-
-    async function getAdminEmail() {
-      if (!staffProfile.adminUid) return null;
-      const snap = await getDoc(doc(db,"admins",staffProfile.adminUid));
-      return snap.exists() ? snap.data().email : null;
-    }
-
-    async function notifyAdmin(action) {
-      const key  = dayKey();
-      const snap = await getDoc(doc(db,"attendance",`${staffProfile.id}_${key}`));
-      if (!snap.exists()) return;
-      const data    = snap.data();
-      const entries = data.entries || [];
-      const time    = action === "in"
-        ? fmt12(entries[entries.length-1]?.in)
-        : fmt12(entries[entries.length-1]?.out);
-      const adminEmail = await getAdminEmail();
-      if (!adminEmail) { showToast("Admin email not found","warn"); return; }
-      const adminSnap   = await getDoc(doc(db,"admins",staffProfile.adminUid));
-      const societyName = adminSnap?.exists() ? adminSnap.data().society : "Society";
-      await sendEmailNotification({
-        staffName: staffProfile.name, staffEmail: staffProfile.email,
-        action, time, adminEmail, societyName
-      });
-    }
-    async function loadTodayAttendance(staffList) {
-      const key = dayKey();
-      const logsRef = collection(db,"attendance");
-      const q = query(logsRef, where("adminUid","==",currentUser.uid), where("date","==",key));
-      unsubLogs && unsubLogs();
-      unsubLogs = onSnapshot(q, async snap => {
-        const logMap = {};
-        snap.docs.forEach(d=>{ logMap[d.data().staffId]=d.data(); });
-        // get staff if not passed
-        if (!staffList) {
-          const sQ = query(collection(db,"staff"), where("adminUid","==",currentUser.uid));
-          const sSnap = await getDocs(sQ);
-          staffList = sSnap.docs.map(d=>({id:d.id,...d.data()}));
-        }
-        renderAttendanceTable(staffList, logMap, key);
-        renderSummaryCards(staffList, logMap);
-      });
-    }
-
-    function renderAttendanceTable(staff, logMap, date) {
-      const tbody = $("attendance-tbody");
-      if (!staff.length) { tbody.innerHTML=`<tr><td colspan="7" class="empty-state">No staff yet</td></tr>`; return; }
-      tbody.innerHTML = staff.map(s => {
-        const log = logMap[s.id] || {};
-        const inTime  = log.checkIn  ? fmt12(log.checkIn)  : "—";
-        const outTime = log.checkOut ? fmt12(log.checkOut) : "—";
-        const late = log.checkIn ? isLate(log.checkIn, s.shiftStart) : false;
-        const dur  = log.checkIn && log.checkOut ? getDuration(log.checkIn, log.checkOut) : "—";
-        const status = !log.checkIn ? "Absent" : !log.checkOut ? "Checked In" : "Completed";
-        return `<tr>
-          <td><b>${s.name}</b></td>
-          <td>${s.designation}</td>
-          <td class="mono">${s.shiftStart}</td>
-          <td class="mono">${inTime}${late?`<span class="late-badge">Late</span>`:""}</td>
-          <td class="mono">${outTime}</td>
-          <td class="mono">${dur}</td>
-          <td><span class="status-badge status-${status.toLowerCase().replace(" ","-")}">${status}</span></td>
-        </tr>`;
-      }).join("");
-    }
-
-    function renderSummaryCards(staff, logMap) {
-      const present = staff.filter(s=>logMap[s.id]?.checkIn).length;
-      const late    = staff.filter(s=>logMap[s.id]?.checkIn && isLate(logMap[s.id].checkIn, s.shiftStart)).length;
-      const absent  = staff.length - present;
-      $("card-total").textContent   = staff.length;
-      $("card-present").textContent = present;
-      $("card-late").textContent    = late;
-      $("card-absent").textContent  = absent;
-    }
-
-    function isLate(checkInIso, shiftStart) {
-      if (!checkInIso||!shiftStart) return false;
-      const d=new Date(checkInIso), [sh,sm]=shiftStart.split(":").map(Number);
-      return (d.getHours()*60+d.getMinutes()) > (sh*60+sm);
-    }
-
-    function getDuration(inIso,outIso) {
-      const mins = Math.round((new Date(outIso)-new Date(inIso))/60000);
-      return `${Math.floor(mins/60)}h ${pad(mins%60)}m`;
-    }
-
-    // ── Export CSV ────────────────────────────────────────────────
-    window.exportCSV = async () => {
-      const sQ = query(collection(db,"staff"), where("adminUid","==",currentUser.uid));
-      const sSnap = await getDocs(sQ);
-      const staff = sSnap.docs.map(d=>({id:d.id,...d.data()}));
-      const key   = dayKey();
-      const lQ    = query(collection(db,"attendance"),where("adminUid","==",currentUser.uid),where("date","==",key));
-      const lSnap = await getDocs(lQ);
-      const logMap={};
-      lSnap.docs.forEach(d=>{ logMap[d.data().staffId]=d.data(); });
-      const rows = [["Date","Name","Designation","Shift","Check In","Check Out","Hours","Status","Late"]];
-      staff.forEach(s=>{
-        const log=logMap[s.id]||{};
-        const dur=log.checkIn&&log.checkOut?getDuration(log.checkIn,log.checkOut):"";
-        const status=!log.checkIn?"Absent":!log.checkOut?"Checked In":"Completed";
-        rows.push([key,s.name,s.designation,s.shiftStart,
-          log.checkIn?fmt12(log.checkIn):"",log.checkOut?fmt12(log.checkOut):"",
-          dur,status,log.checkIn&&isLate(log.checkIn,s.shiftStart)?"Yes":"No"]);
-      });
-      const csv=rows.map(r=>r.map(v=>`"${v}"`).join(",")).join("\n");
-      const a=document.createElement("a");
-      a.href="data:text/csv;charset=utf-8,"+encodeURIComponent(csv);
-      a.download=`attendance_${key}.csv`; a.click();
-    };
-
-    // ══════════════════════════════════════════════════════════════
-    //  STAFF DASHBOARD
-    // ══════════════════════════════════════════════════════════════
-    async function loadStaffDashboard() {
-      showSection("staff-section");
-      $("staff-welcome").textContent = staffProfile.name;
-      $("staff-initials").textContent = initials(staffProfile.name);
-      $("staff-role").textContent    = staffProfile.designation;
-      $("staff-shift").textContent   = `Shift: ${staffProfile.shiftStart} – ${staffProfile.shiftEnd}`;
-      $("staff-date").textContent    = todayFull();
-      startClock("staff-live-clock");
-      listenStaffLog();
-      loadStaffSociety();
-      loadMyHistory();
-    }
-
-    async function loadStaffSociety() {
-      if (!staffProfile.adminUid) return;
-      const snap = await getDoc(doc(db,"admins",staffProfile.adminUid));
-      $("staff-society-name").textContent = snap.exists() ? snap.data().society : "Your Society";
-    }
-
-    // ── Staff's own attendance history (read-only, last 14 days by default) ──
-    async function loadMyHistory() {
-      const listEl = $("my-history-list");
-      if (!listEl) return;
-      listEl.innerHTML = `<div class="empty-state">Loading…</div>`;
-      try {
-        const hq = query(collection(db,"attendance"), where("staffId","==",staffProfile.id));
-        const snap = await getDocs(hq);
-        const rows = snap.docs
-          .map(d => d.data())
-          .sort((a,b) => b.date.localeCompare(a.date))
-          .slice(0, 14);
-        renderMyHistory(rows);
-      } catch (e) {
-        console.error(e);
-        listEl.innerHTML = `<div class="empty-state">Couldn't load history</div>`;
-      }
-    }
-
-    function renderMyHistory(rows) {
-      const listEl = $("my-history-list");
-      if (!rows.length) {
-        listEl.innerHTML = `<div class="empty-state">No attendance records yet</div>`;
-        return;
-      }
-      listEl.innerHTML = rows.map(r => {
-        const inTime  = r.checkIn  ? fmt12(r.checkIn)  : "—";
-        const outTime = r.checkOut ? fmt12(r.checkOut) : "—";
-        const dur = r.checkIn && r.checkOut ? getDuration(r.checkIn, r.checkOut) : "—";
-        const status = !r.checkIn ? "Absent" : !r.checkOut ? "Checked In" : "Completed";
-        return `<div class="history-row">
-          <div class="history-row-date">${r.date}</div>
-          <div class="history-row-times"><span class="mono">${inTime}</span> → <span class="mono">${outTime}</span></div>
-          <div class="history-row-hours mono">${dur}</div>
-          <span class="status-badge status-${status.toLowerCase().replace(" ","-")}">${status}</span>
-        </div>`;
-      }).join("");
-    }
-
-    function listenStaffLog() {
-      const key = dayKey();
-      const logRef = doc(db,"attendance",`${staffProfile.id}_${key}`);
-      onSnapshot(logRef, snap => {
-        const data = snap.exists() ? snap.data() : {};
-        updateStaffUI(data);
-      });
-    }
-
-    function updateStaffUI(log) {
-      const inBtn  = $("btn-checkin");
-      const outBtn = $("btn-checkout");
-      const inEl   = $("display-in");
-      const outEl  = $("display-out");
-      inEl.textContent  = log.checkIn  ? fmt12(log.checkIn)  : "—";
-      outEl.textContent = log.checkOut ? fmt12(log.checkOut) : "—";
-      if (!log.checkIn) {
-        inBtn.disabled  = false;
-        outBtn.disabled = true;
-      } else if (!log.checkOut) {
-        inBtn.disabled  = true;
-        outBtn.disabled = false;
-      } else {
-        inBtn.disabled  = true;
-        outBtn.disabled = true;
-      }
-    }
-
-    // ── App guide modal ───────────────────────────────────────────
-    window.openGuide  = () => $("guide-modal").classList.remove("hidden");
-    window.closeGuide = () => $("guide-modal").classList.add("hidden");
-
-    async function getAdminEmail() {
-      if (!staffProfile.adminUid) return null;
-      const snap = await getDoc(doc(db,"admins",staffProfile.adminUid));
-      return snap.exists() ? snap.data().email : null;
-    }
-
-    // Automatically notifies the admin right after a confirmed check-in/out — no manual button needed.
-    async function notifyAdmin(action) {
-      const key  = dayKey();
-      const snap = await getDoc(doc(db,"attendance",`${staffProfile.id}_${key}`));
-      if (!snap.exists()) return;
-      const log = snap.data();
-      const adminEmail = await getAdminEmail();
-      if (!adminEmail) { showToast("Admin email not found — couldn't send notification","warn"); return; }
-      const adminSnap   = await getDoc(doc(db,"admins",staffProfile.adminUid));
-      const societyName = adminSnap.exists() ? adminSnap.data().society : "Society";
-      const time = action === "in" ? log.checkIn : log.checkOut;
-      await sendEmailNotification({
-        staffName: staffProfile.name, staffEmail: staffProfile.email,
-        action, time: fmt12(time), adminEmail, societyName
-      });
-    }
-  </script>
-
-  <style>
-    /* ── Reset & Variables ─────────────────────── */
-    *, *::before, *::after { box-sizing: border-box; margin:0; padding:0; }
-    :root {
-      --bg:       #F1EEFB;
-      --surface:  #FFFFFF;
-      --card:     #FFFFFF;
-      --accent:   #6D28D9;
-      --accent-light: #7C3AED;
-      --accent2:  #E94F8A;
-      --teal:     #0D9488;
-      --amber:    #D97706;
-      --text:     #1F1B33;
-      --muted:    #6B6480;
-      --border:   #E4DEF7;
-      --radius:   16px;
-      --mono:     'JetBrains Mono','SF Mono',Consolas,monospace;
-    }
-    body {
-      background: linear-gradient(180deg, #ECE7FB 0%, #F4F1FC 40%, #EFEAFA 100%);
-      color:var(--text); font-family:'Inter',system-ui,sans-serif; min-height:100vh;
-    }
-    .hidden { display:none !important; }
-    a { color:var(--accent); text-decoration:none; font-weight:600; }
-
-    /* ── Toast ─────────────────────────────────── */
-    .toast {
-      position:fixed; bottom:24px; left:50%; transform:translateX(-50%) translateY(20px);
-      background:var(--card); border:1px solid var(--border); color:var(--text);
-      padding:12px 20px; border-radius:40px; font-size:13.5px; font-weight:600;
-      opacity:0; transition:.3s; z-index:9999; white-space:nowrap;
-      box-shadow:0 8px 32px rgba(109,40,217,.18);
-    }
-    .toast.show { opacity:1; transform:translateX(-50%) translateY(0); }
-    .toast-success { border-color:var(--teal); }
-    .toast-error   { border-color:var(--accent2); }
-    .toast-warn    { border-color:var(--amber); }
-
-    /* ── Layout ────────────────────────────────── */
-    .section { max-width:960px; margin:0 auto; padding:32px 20px; }
-    header {
-      display:flex; justify-content:space-between; align-items:center;
-      padding:14px 28px; background:var(--surface);
-      border-bottom:1px solid var(--border); position:sticky; top:0; z-index:10;
-    }
-    .logo { display:flex; align-items:center; gap:10px; }
-    .logo-mark {
-      width:36px; height:36px; border-radius:10px;
-      background:var(--accent); display:flex; align-items:center; justify-content:center;
-      font-size:18px;
-    }
-    .logo-text { font-weight:800; font-size:16px; letter-spacing:-.5px; }
-    .logo-sub  { font-size:11px; color:var(--muted); }
-
-    /* ── Auth ──────────────────────────────────── */
-    #auth-section {
-      display:flex; flex-direction:column; align-items:center; justify-content:center;
-      min-height:100vh; padding:20px; gap:0;
-    }
-    .auth-card {
-      background:var(--surface); border:1px solid var(--border); border-radius:24px;
-      padding:36px 32px; width:100%; max-width:420px;
-      box-shadow:0 20px 50px rgba(109,40,217,.12), 0 2px 10px rgba(31,27,51,.06);
-    }
-    .auth-title { font-size:22px; font-weight:800; margin-bottom:4px; }
-    .auth-sub   { font-size:13px; color:var(--muted); margin-bottom:28px; }
-    .tab-bar { display:flex; gap:4px; margin-bottom:24px; background:var(--bg); border-radius:10px; padding:4px; }
-    .tab-btn {
-      flex:1; border:none; background:transparent; color:var(--muted); padding:9px;
-      border-radius:8px; font-size:13px; font-weight:600; cursor:pointer; transition:.2s;
-    }
-    .tab-btn.active { background:var(--card); color:var(--text); }
-    .auth-tab-panel { display:flex; flex-direction:column; gap:12px; }
-
-    /* ── Form controls ─────────────────────────── */
-    .input-group { display:flex; flex-direction:column; gap:5px; }
-    .input-group label { font-size:12px; color:var(--muted); font-weight:600; text-transform:uppercase; letter-spacing:.04em; }
-    input, select {
-      background:var(--bg); border:1px solid var(--border); border-radius:9px;
-      padding:11px 14px; color:var(--text); font-size:14px; font-family:inherit;
-      transition:.2s; outline:none; width:100%;
-    }
-    input:focus, select:focus { border-color:var(--accent); box-shadow:0 0 0 3px rgba(109,40,217,.15); }
-    input[type="time"] { font-family:var(--mono); }
-
-    /* ── Buttons ───────────────────────────────── */
-    .btn {
-      border:none; border-radius:10px; padding:12px 18px; font-size:14px;
-      font-weight:700; cursor:pointer; display:flex; align-items:center;
-      justify-content:center; gap:7px; transition:.2s; width:100%;
-    }
-    .btn-primary  { background:linear-gradient(90deg,#7C3AED,#6D28D9); color:#FFFFFF; box-shadow:0 8px 20px rgba(109,40,217,.3); }
-    .btn-primary:hover { filter:brightness(1.1); }
-    .btn-secondary{ background:var(--card); color:var(--text); border:1px solid var(--border); }
-    .btn-secondary:hover { border-color:var(--accent); }
-    .btn-danger   { background:rgba(255,107,107,.15); color:var(--accent2); border:1px solid var(--accent2); }
-    .btn-google   { background:#fff; color:#1F1B33; }
-    .btn-icon     { background:var(--card); border:1px solid var(--border); border-radius:8px; padding:7px 10px; cursor:pointer; font-size:15px; }
-    .btn-edit     { background:rgba(13,148,136,.1); border-color:var(--teal); color:var(--teal); }
-    .btn-del      { background:rgba(255,107,107,.1); border-color:var(--accent2); }
-    .btn:disabled { opacity:.4; cursor:not-allowed; }
-    .btn-email    { background:rgba(255,179,71,.12); color:var(--amber); border:1px solid var(--amber); border-radius:10px; padding:12px 20px; font-size:14px; font-weight:700; cursor:pointer; display:flex; align-items:center; gap:8px; transition:.2s; }
-    .btn-email:hover { background:rgba(255,179,71,.22); }
-    .divider      { text-align:center; color:var(--muted); font-size:12px; margin:8px 0; }
-
-    /* ── Top nav ───────────────────────────────── */
-    .topnav { background:var(--surface); border-bottom:1px solid var(--border); position:sticky; top:0; z-index:10; }
-    .topnav-inner { max-width:960px; margin:0 auto; padding:14px 20px; display:flex; justify-content:space-between; align-items:center; }
-    .user-pill { display:flex; align-items:center; gap:8px; }
-    .avatar-sm { width:32px; height:32px; border-radius:50%; background:var(--accent); display:flex; align-items:center; justify-content:center; font-weight:700; font-size:13px; color:#FFFFFF; }
-    .signout-btn { background:transparent; border:1px solid var(--border); border-radius:8px; padding:7px 12px; color:var(--muted); font-size:13px; cursor:pointer; transition:.2s; }
-    .signout-btn:hover { border-color:var(--accent2); color:var(--accent2); }
-    .help-btn {
-      background:linear-gradient(90deg,#7C3AED,#6D28D9); color:#fff;
-      border:none; border-radius:8px; padding:7px 13px; font-size:13px;
-      font-weight:700; cursor:pointer; transition:.2s;
-      box-shadow:0 4px 12px rgba(109,40,217,.25);
-    }
-    .help-btn:hover { filter:brightness(1.1); }
-
-    /* ── Guide modal ───────────────────────────────── */
-    #guide-modal .modal-box {
-      max-width:660px; max-height:85vh; overflow-y:auto; padding:0;
-    }
-    .guide-header {
-      background:linear-gradient(120deg,#7C3AED,#E94F8A);
-      padding:28px 28px 22px; border-radius:var(--radius) var(--radius) 0 0;
-      color:#fff; position:sticky; top:0; z-index:1;
-    }
-    .guide-header h2 { font-size:20px; font-weight:800; margin-bottom:4px; }
-    .guide-header p  { font-size:13px; opacity:.85; }
-    .guide-close {
-      position:absolute; top:18px; right:20px;
-      background:rgba(255,255,255,.2); border:none; color:#fff;
-      border-radius:50%; width:30px; height:30px; font-size:16px;
-      cursor:pointer; display:flex; align-items:center; justify-content:center;
-    }
-    .guide-body { padding:24px 28px 28px; }
-    .guide-section { margin-bottom:28px; }
-    .guide-section:last-child { margin-bottom:0; }
-    .guide-section-title {
-      font-size:13px; font-weight:800; text-transform:uppercase;
-      letter-spacing:.06em; color:var(--accent); margin-bottom:12px;
-      padding-bottom:6px; border-bottom:2px solid var(--border);
-    }
-    .guide-item {
-      display:flex; gap:12px; margin-bottom:12px; align-items:flex-start;
-    }
-    .guide-icon {
-      width:34px; height:34px; border-radius:9px; flex-shrink:0;
-      display:flex; align-items:center; justify-content:center; font-size:16px;
-    }
-    .guide-icon.purple { background:#EDE9FE; }
-    .guide-icon.teal   { background:#CCFBF1; }
-    .guide-icon.pink   { background:#FCE7F3; }
-    .guide-icon.amber  { background:#FEF3C7; }
-    .guide-icon.green  { background:#DCFCE7; }
-    .guide-icon.blue   { background:#DBEAFE; }
-    .guide-item-title  { font-weight:700; font-size:14px; margin-bottom:3px; }
-    .guide-item-desc   { font-size:13px; color:var(--muted); line-height:1.55; }
-    .guide-badge {
-      display:inline-block; font-size:11px; font-weight:700; padding:2px 8px;
-      border-radius:5px; margin-right:4px; margin-bottom:3px;
-    }
-    .guide-badge.admin  { background:#EDE9FE; color:#6D28D9; }
-    .guide-badge.staff  { background:#CCFBF1; color:#0D9488; }
-    .guide-badge.both   { background:#FEF3C7; color:#B45309; }
-    .guide-role-card {
-      border-radius:12px; padding:16px; margin-bottom:12px;
-      border:1px solid var(--border);
-    }
-    .guide-role-card.admin-card { background:#F5F3FF; border-color:#DDD6FE; }
-    .guide-role-card.staff-card { background:#F0FDFA; border-color:#99F6E4; }
-    .guide-role-title { font-weight:800; font-size:14px; margin-bottom:8px; }
-    .guide-step {
-      display:flex; gap:10px; align-items:flex-start; margin-bottom:10px;
-    }
-    .guide-step-num {
-      width:22px; height:22px; border-radius:50%; background:var(--accent);
-      color:#fff; font-size:11px; font-weight:800;
-      display:flex; align-items:center; justify-content:center; flex-shrink:0; margin-top:1px;
-    }
-    .guide-step-num.teal { background:var(--teal); }
-    .guide-step-text { font-size:13px; color:var(--muted); line-height:1.5; }
-    .guide-email-box {
-      background:var(--bg); border:1px solid var(--border); border-radius:10px;
-      padding:14px 16px; margin-bottom:10px;
-    }
-    .guide-email-type { font-weight:700; font-size:13px; margin-bottom:5px; }
-    .guide-email-desc { font-size:12.5px; color:var(--muted); line-height:1.5; }
-
-    /* ── Admin tabs ────────────────────────────── */
-    .tab-row { display:flex; gap:6px; margin-bottom:24px; }
-    .admin-tab-btn {
-      border:1px solid var(--border); background:var(--surface); color:var(--muted);
-      border-radius:9px; padding:9px 18px; font-size:13px; font-weight:600; cursor:pointer; transition:.2s;
-    }
-    .admin-tab-btn.active { background:linear-gradient(90deg,#7C3AED,#6D28D9); color:#FFFFFF; border-color:transparent; box-shadow:0 6px 16px rgba(109,40,217,.25); }
-
-    /* ── Summary cards ─────────────────────────── */
-    .summary-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr)); gap:12px; margin-bottom:24px; }
-    .summary-card {
-      background:var(--card); border:1px solid var(--border); border-radius:var(--radius);
-      padding:16px 18px; box-shadow:0 4px 16px rgba(31,27,51,.05);
-    }
-    .summary-label { font-size:11px; font-weight:700; color:var(--muted); text-transform:uppercase; letter-spacing:.05em; margin-bottom:8px; }
-    .summary-value { font-family:var(--mono); font-size:32px; font-weight:700; }
-    .summary-value.green { color:var(--teal); }
-    .summary-value.amber { color:var(--amber); }
-    .summary-value.red   { color:var(--accent2); }
-
-    /* ── Attendance table ──────────────────────── */
-    .table-wrap { background:var(--card); border:1px solid var(--border); border-radius:var(--radius); overflow:auto; box-shadow:0 4px 20px rgba(31,27,51,.05); }
-    table { width:100%; border-collapse:collapse; font-size:13.5px; }
-    th { text-align:left; padding:12px 16px; font-size:11px; font-weight:700; color:var(--muted); text-transform:uppercase; letter-spacing:.04em; border-bottom:1px solid var(--border); white-space:nowrap; }
-    td { padding:13px 16px; border-bottom:1px solid var(--border); vertical-align:middle; }
-    tr:last-child td { border-bottom:none; }
-    .mono { font-family:var(--mono); }
-    .late-badge { margin-left:7px; font-size:10px; font-weight:700; background:rgba(255,179,71,.18); color:var(--amber); padding:2px 7px; border-radius:5px; font-family:inherit; }
-    .status-badge { font-size:12px; font-weight:600; padding:4px 10px; border-radius:6px; }
-    .status-absent      { background:rgba(255,107,107,.12); color:var(--accent2); }
-    .status-checked-in  { background:rgba(255,179,71,.15);  color:var(--amber); }
-    .status-completed   { background:rgba(13,148,136,.12);   color:var(--teal); }
-
-    /* ── Staff cards ───────────────────────────── */
-    .staff-card {
-      background:var(--card); border:1px solid var(--border); border-radius:var(--radius);
-      padding:16px; display:flex; align-items:center; gap:14px; margin-bottom:10px;
-      box-shadow:0 3px 14px rgba(31,27,51,.04);
-    }
-    .staff-avatar {
-      width:44px; height:44px; border-radius:50%; background:var(--accent);
-      display:flex; align-items:center; justify-content:center;
-      font-weight:800; font-size:15px; color:#FFFFFF; flex-shrink:0;
-    }
-    .staff-info  { flex:1; }
-    .staff-name  { font-weight:700; font-size:15px; }
-    .staff-meta  { font-size:12px; color:var(--muted); margin-top:2px; }
-    .staff-actions { display:flex; gap:8px; }
-
-    /* ── Add staff form ────────────────────────── */
-    .add-form {
-      background:var(--card); border:1px solid var(--border); border-radius:var(--radius);
-      padding:22px; margin-bottom:22px;
-    }
-    .add-form h3 { font-size:15px; margin-bottom:16px; }
-    .form-row { display:grid; grid-template-columns:1fr 1fr; gap:12px; margin-bottom:12px; }
-    @media(max-width:600px) { .form-row { grid-template-columns:1fr; } }
-
-    /* ── Staff dashboard ───────────────────────── */
-    .staff-hero {
-      background:var(--card); border:1px solid var(--border); border-radius:var(--radius);
-      padding:28px; text-align:center; margin-bottom:24px;
-    }
-    .big-avatar {
-      width:70px; height:70px; border-radius:50%; background:var(--accent);
-      display:flex; align-items:center; justify-content:center;
-      font-weight:800; font-size:26px; color:#FFFFFF; margin:0 auto 14px;
-    }
-    .big-clock { font-family:var(--mono); font-size:42px; font-weight:700; color:var(--accent); margin:10px 0; }
-    .time-grid { display:grid; grid-template-columns:1fr 1fr; gap:14px; margin:24px 0; }
-    .time-box {
-      background:var(--surface); border:1px solid var(--border); border-radius:12px;
-      padding:16px; text-align:center;
-    }
-    .time-label { font-size:11px; color:var(--muted); text-transform:uppercase; letter-spacing:.05em; font-weight:600; }
-    .time-value { font-family:var(--mono); font-size:22px; font-weight:700; margin-top:6px; }
-    .action-row { display:grid; grid-template-columns:1fr 1fr; gap:12px; margin-bottom:14px; }
-    .email-row  { display:grid; grid-template-columns:1fr 1fr; gap:12px; }
-    @media(max-width:480px) { .action-row,.email-row,.time-grid { grid-template-columns:1fr; } }
-
-    /* ── Modal ─────────────────────────────────── */
-    .modal-overlay {
-      position:fixed; inset:0; background:rgba(31,27,51,.55);
-      display:flex; align-items:center; justify-content:center; padding:20px; z-index:200;
-    }
-    .modal-box {
-      background:var(--surface); border:1px solid var(--border); border-radius:var(--radius);
-      padding:28px; width:100%; max-width:440px;
-      box-shadow:0 24px 60px rgba(31,27,51,.18);
-    }
-    .modal-title { font-size:17px; font-weight:800; margin-bottom:20px; }
-    .modal-actions { display:flex; gap:10px; margin-top:20px; }
-
-    /* ── Staff history modal ───────────────────── */
-    .history-box { max-width:620px; }
-    .history-range-row { display:grid; grid-template-columns:1fr 1fr auto auto; gap:10px; align-items:end; }
-    @media(max-width:560px) { .history-range-row { grid-template-columns:1fr 1fr; } }
-
-    /* ── Staff's own history list ──────────────── */
-    .history-list { display:flex; flex-direction:column; gap:8px; margin-top:6px; }
-    .history-row {
-      background:var(--card); border:1px solid var(--border); border-radius:12px;
-      padding:12px 14px; display:flex; align-items:center; gap:12px;
-      box-shadow:0 2px 10px rgba(31,27,51,.04);
-    }
-    .history-row-date { font-weight:700; font-size:13px; min-width:88px; }
-    .history-row-times { font-size:12.5px; color:var(--muted); flex:1; }
-    .history-row-hours { font-size:12.5px; color:var(--muted); min-width:60px; }
-    @media(max-width:420px) {
-      .history-row { flex-wrap:wrap; }
-      .history-row-date { min-width:100%; }
-    }
-    .staff-card-clickable { cursor:pointer; transition:transform .15s ease, box-shadow .15s ease; }
-    .staff-card-clickable:hover { transform:translateY(-2px); box-shadow:0 10px 26px rgba(109,40,217,.12); border-color:#D8CCF7; }
-
-    /* ── Misc ──────────────────────────────────── */
-    .empty-state { padding:40px; text-align:center; color:var(--muted); font-size:14px; }
-    .page-title  { font-size:22px; font-weight:800; margin-bottom:4px; }
-    .page-sub    { font-size:13px; color:var(--muted); margin-bottom:24px; }
-    .section-title { font-size:15px; font-weight:700; margin-bottom:14px; }
-    .row-between { display:flex; justify-content:space-between; align-items:center; margin-bottom:16px; flex-wrap:wrap; gap:10px; }
-  </style>
+    showToast("📧 Admin notified by email","success");
+  } catch(e){ showToast("⚠️ Email failed – check EmailJS config","warn"); console.error(e); }
+}
+
+// ── UI utils ──────────────────────────────────────────────────────────────────
+const showSection = id => { document.querySelectorAll(".page-section").forEach(s=>s.classList.add("hidden")); $(id).classList.remove("hidden"); };
+function showToast(msg,type="info") {
+  const t=document.createElement("div"); t.className=`toast toast-${type}`; t.textContent=msg;
+  document.body.appendChild(t); setTimeout(()=>t.classList.add("show"),10);
+  setTimeout(()=>{t.classList.remove("show");setTimeout(()=>t.remove(),400);},3500);
+}
+function startClock(id) {
+  const el=$(id); if(!el) return;
+  clockInterval&&clearInterval(clockInterval);
+  const tick=()=>{el.textContent=new Date().toLocaleTimeString("en-IN",{hour:"2-digit",minute:"2-digit",second:"2-digit"});};
+  tick(); clockInterval=setInterval(tick,1000);
+}
+window.showTab = tab => {
+  document.querySelectorAll(".auth-panel").forEach(p=>p.classList.add("hidden"));
+  document.querySelectorAll(".tab-btn").forEach(b=>b.classList.remove("active"));
+  $(`tab-${tab}`).classList.remove("hidden");
+  document.querySelector(`[data-tab="${tab}"]`).classList.add("active");
+};
+window.showAdminTab = tab => {
+  document.querySelectorAll(".admin-panel").forEach(p=>p.classList.add("hidden"));
+  document.querySelectorAll(".adm-tab-btn").forEach(b=>b.classList.remove("active"));
+  $(`apanel-${tab}`).classList.remove("hidden");
+  document.querySelector(`[data-atab="${tab}"]`).classList.add("active");
+};
+window.openGuide  = () => $("guide-modal").classList.remove("hidden");
+window.closeGuide = () => $("guide-modal").classList.add("hidden");
+
+// ── AUTH ──────────────────────────────────────────────────────────────────────
+onAuthStateChanged(auth, async user => {
+  const tok = ++authToken;
+  unsubLogs&&unsubLogs(); unsubLogs=null;
+  unsubStaff&&unsubStaff(); unsubStaff=null;
+  clockInterval&&clearInterval(clockInterval);
+  adminProfile=null; staffProfile=null; role=null;
+
+  if(!user){ if(tok!==authToken) return; showSection("auth-section"); return; }
+  currentUser=user;
+
+  // ── is admin? ──
+  const aSnap = await getDoc(doc(db,"admins",user.uid));
+  if(tok!==authToken) return;
+  if(aSnap.exists()){ adminProfile=aSnap.data(); role="admin"; loadAdminDashboard(); return; }
+
+  // ── is staff? match by email ──
+  const sQ=query(collection(db,"staff"),where("email","==",user.email.toLowerCase()));
+  const sSnap=await getDocs(sQ);
+  if(tok!==authToken) return;
+  if(!sSnap.empty){
+    const docs=sSnap.docs.sort((a,b)=>(b.data().createdAt?.seconds||0)-(a.data().createdAt?.seconds||0));
+    staffProfile={id:docs[0].id,...docs[0].data()};
+    if(!staffProfile.uid){ await updateDoc(doc(db,"staff",staffProfile.id),{uid:user.uid}); staffProfile.uid=user.uid; }
+    role="staff"; loadStaffDashboard(); return;
+  }
+
+  showToast("Account not recognised. Contact your society admin.","warn");
+  await signOut(auth);
+});
+
+window.googleSignIn = async () => { try{ await signInWithPopup(auth,new GoogleAuthProvider()); }catch(e){showToast(e.message,"error");} };
+window.adminRegister = async () => {
+  const email=$("reg-email").value.trim(), pass=$("reg-pass").value, society=$("reg-society").value.trim();
+  if(!email||!pass||!society){showToast("Fill all fields","warn");return;}
+  if(pass.length<6){showToast("Password must be at least 6 characters","warn");return;}
+  try{
+    const cred=await createUserWithEmailAndPassword(auth,email,pass);
+    await setDoc(doc(db,"admins",cred.user.uid),{email,society,createdAt:serverTimestamp()});
+    showToast("Admin account created!","success");
+  }catch(e){showToast(e.message,"error");}
+};
+window.adminLogin = async () => {
+  const email=$("login-email").value.trim(), pass=$("login-pass").value;
+  if(!email||!pass){showToast("Enter email and password","warn");return;}
+  try{ await signInWithEmailAndPassword(auth,email,pass); }catch(e){ showToast("Login failed: "+e.message,"error"); }
+};
+window.forgotPassword = async () => {
+  const email=$("login-email").value.trim();
+  if(!email){showToast("Enter your email first","warn");return;}
+  try{ await sendPasswordResetEmail(auth,email); showToast("Reset link sent to "+email,"success"); }catch(e){showToast(e.message,"error");}
+};
+window.doSignOut = async () => {
+  unsubLogs&&unsubLogs(); unsubStaff&&unsubStaff(); clearInterval(clockInterval);
+  const aBody=$("attendance-tbody"); if(aBody) aBody.innerHTML=`<tr><td colspan="6" class="empty-state">Loading…</td></tr>`;
+  const sList=$("staff-list-admin"); if(sList) sList.innerHTML="";
+  adminProfile=staffProfile=role=null; await signOut(auth);
+};
+
+// ── ADMIN DASHBOARD ───────────────────────────────────────────────────────────
+function loadAdminDashboard() {
+  showSection("admin-section");
+  $("admin-society").textContent=$("admin-society-sub").textContent=adminProfile.society;
+  $("admin-email-lbl").textContent=adminProfile.email;
+  $("admin-date").textContent=todayFull();
+  startClock("admin-clock");
+  showAdminTab("attendance");
+  loadStaffList();
+  loadTodayAttendance();
+}
+
+function loadStaffList() {
+  const el=$("staff-list-admin"); unsubStaff&&unsubStaff();
+  const q=query(collection(db,"staff"),where("adminUid","==",currentUser.uid));
+  unsubStaff=onSnapshot(q,snap=>{
+    const staff=snap.docs.map(d=>({id:d.id,...d.data()}));
+    renderStaffList(staff,el);
+    loadTodayAttendance(staff);
+  });
+}
+
+function renderStaffList(staff,container) {
+  if(!staff.length){container.innerHTML=`<div class="empty-state">No staff yet. Add your first member above.</div>`;return;}
+  container.innerHTML=staff.map(s=>`
+    <div class="staff-card staff-clickable" onclick="openStaffHistory('${s.id}','${esc(s.name)}','${esc(s.designation)}')">
+      <div class="savatar">${initials(s.name)}</div>
+      <div class="staff-info">
+        <div class="staff-name">${s.name}</div>
+        <div class="staff-meta">${s.designation||""} · ${s.email}</div>
+        <div class="staff-meta">Shift: ${s.shiftStart} – ${s.shiftEnd}</div>
+      </div>
+      <div class="staff-actions" onclick="event.stopPropagation()">
+        <button class="icon-btn edit-btn" onclick="openEditStaff('${s.id}','${esc(s.name)}','${esc(s.email)}','${esc(s.designation)}','${s.shiftStart}','${s.shiftEnd}')">✏️</button>
+        <button class="icon-btn del-btn"  onclick="delStaff('${s.id}','${esc(s.name)}')">🗑</button>
+      </div>
+    </div>`).join("");
+}
+
+window.addStaff = async () => {
+  const name=$("new-name").value.trim(), email=$("new-email").value.trim().toLowerCase(),
+        desig=$("new-desig").value.trim(), shiftS=$("new-shift-start").value, shiftE=$("new-shift-end").value;
+  if(!name||!email||!desig||!shiftS||!shiftE){showToast("Fill all fields","warn");return;}
+  const dupQ=query(collection(db,"staff"),where("adminUid","==",currentUser.uid),where("email","==",email));
+  if(!(await getDocs(dupQ)).empty){showToast("A staff member with this email already exists","warn");return;}
+  const id=currentUser.uid+"_"+email.replace(/[^a-z0-9]/g,"_");
+  await setDoc(doc(db,"staff",id),{name,email,designation:desig,shiftStart:shiftS,shiftEnd:shiftE,adminUid:currentUser.uid,createdAt:serverTimestamp()});
+  ["new-name","new-email","new-desig"].forEach(f=>$(f).value="");
+  showToast(`${name} added. They can now log in with ${email}.`,"success");
+};
+
+window.openEditStaff = (id,name,email,desig,shiftS,shiftE) => {
+  $("edit-id").value=id; $("edit-name").value=name; $("edit-email").value=email;
+  $("edit-desig").value=desig; $("edit-shift-start").value=shiftS; $("edit-shift-end").value=shiftE;
+  $("edit-modal").classList.remove("hidden");
+};
+window.saveEdit = async () => {
+  const id=$("edit-id").value;
+  await updateDoc(doc(db,"staff",id),{name:$("edit-name").value.trim(),designation:$("edit-desig").value.trim(),shiftStart:$("edit-shift-start").value,shiftEnd:$("edit-shift-end").value});
+  $("edit-modal").classList.add("hidden"); showToast("Staff details updated","success");
+};
+window.closeEditModal = () => $("edit-modal").classList.add("hidden");
+window.delStaff = async (id,name) => {
+  if(!confirm(`Remove ${name} from the system?`)) return;
+  await deleteDoc(doc(db,"staff",id)); showToast(`${name} removed`,"info");
+};
+
+async function loadTodayAttendance(staffList) {
+  const key=dayKey();
+  const q=query(collection(db,"attendance"),where("adminUid","==",currentUser.uid),where("date","==",key));
+  unsubLogs&&unsubLogs();
+  unsubLogs=onSnapshot(q,async snap=>{
+    const logMap={}; snap.docs.forEach(d=>{logMap[d.data().staffId]=d.data();});
+    if(!staffList){
+      const sq=query(collection(db,"staff"),where("adminUid","==",currentUser.uid));
+      staffList=(await getDocs(sq)).docs.map(d=>({id:d.id,...d.data()}));
+    }
+    renderAttendanceTable(staffList,logMap);
+    renderSummaryCards(staffList,logMap);
+  });
+}
+
+function renderAttendanceTable(staff,logMap) {
+  const tbody=$("attendance-tbody");
+  if(!staff.length){tbody.innerHTML=`<tr><td colspan="6" class="empty-state">No staff yet</td></tr>`;return;}
+  tbody.innerHTML=staff.map(s=>{
+    const log=logMap[s.id]||{};
+    const entries=getEntries(log);
+    const late=isLate(log,s.shiftStart);
+    const hasIn=entries.length>0;
+    const allDone=hasIn&&entries.every(e=>e.out);
+    const status=!hasIn?"Absent":allDone?"Completed":"Checked In";
+    const entryHtml=entries.length
+      ?entries.map((e,i)=>`<div style="font-size:11.5px;font-family:var(--mono);color:var(--muted);">${i+1}. ${fmt12(e.in)} → ${e.out?fmt12(e.out):`<b style="color:var(--teal)">now</b>`}</div>`).join("")
+      :`<span style="color:var(--muted)">—</span>`;
+    return `<tr>
+      <td><b>${s.name}</b>${late?`<span class="late-tag">Late</span>`:""}</td>
+      <td style="font-size:12.5px">${s.designation||""}</td>
+      <td class="mono" style="font-size:12px">${s.shiftStart}</td>
+      <td style="min-width:160px">${entryHtml}</td>
+      <td class="mono">${fmtHours(log)}</td>
+      <td><span class="sbadge sbadge-${status.toLowerCase().replace(" ","-")}">${status}</span></td>
+    </tr>`;
+  }).join("");
+}
+
+function renderSummaryCards(staff,logMap) {
+  $("card-total").textContent=staff.length;
+  $("card-present").textContent=staff.filter(s=>getEntries(logMap[s.id]||{}).length>0).length;
+  $("card-late").textContent=staff.filter(s=>{const l=logMap[s.id]||{};return getEntries(l).length>0&&isLate(l,s.shiftStart);}).length;
+  $("card-absent").textContent=staff.filter(s=>getEntries(logMap[s.id]||{}).length===0).length;
+}
+
+window.exportTodayCSV = async () => {
+  const sq=query(collection(db,"staff"),where("adminUid","==",currentUser.uid));
+  const staff=(await getDocs(sq)).docs.map(d=>({id:d.id,...d.data()}));
+  const key=dayKey();
+  const lq=query(collection(db,"attendance"),where("adminUid","==",currentUser.uid),where("date","==",key));
+  const lSnap=await getDocs(lq); const logMap={};
+  lSnap.docs.forEach(d=>{logMap[d.data().staffId]=d.data();});
+  const rows=[["Date","Name","Designation","Shift","Entries","Total Hours","Status","Late"]];
+  staff.forEach(s=>{
+    const log=logMap[s.id]||{};
+    const entries=getEntries(log);
+    const status=!entries.length?"Absent":entries.every(e=>e.out)?"Completed":"Checked In";
+    rows.push([key,s.name,s.designation||"",s.shiftStart,entryLines(log),fmtHours(log),status,entries.length&&isLate(log,s.shiftStart)?"Yes":"No"]);
+  });
+  downloadCSV(rows,`attendance_${key}.csv`);
+  showToast("CSV exported","success");
+};
+
+// ── STAFF HISTORY (admin view) ────────────────────────────────────────────────
+let histId=null, histName=null;
+window.openStaffHistory = (id,name,desig) => {
+  histId=id; histName=name;
+  $("hist-name").textContent=name; $("hist-desig").textContent=desig; $("hist-initials").textContent=initials(name);
+  const to=new Date(), from=new Date(); from.setDate(from.getDate()-6);
+  $("hist-from").value=dayKey(from); $("hist-to").value=dayKey(to);
+  $("hist-modal").classList.remove("hidden");
+  loadStaffHistory();
+};
+window.closeHistModal = () => { $("hist-modal").classList.add("hidden"); histId=null; };
+window.loadStaffHistory = async () => {
+  if(!histId) return;
+  const from=$("hist-from").value, to=$("hist-to").value;
+  if(!from||!to){showToast("Pick both dates","warn");return;}
+  if(from>to){showToast("From must be before To","warn");return;}
+  const tbody=$("hist-tbody");
+  tbody.innerHTML=`<tr><td colspan="4" class="empty-state">Loading…</td></tr>`;
+  try{
+    const q=query(collection(db,"attendance"),where("staffId","==",histId));
+    const rows=(await getDocs(q)).docs.map(d=>d.data())
+      .filter(r=>r.adminUid===currentUser.uid&&r.date>=from&&r.date<=to)
+      .sort((a,b)=>b.date.localeCompare(a.date));
+    if(!rows.length){tbody.innerHTML=`<tr><td colspan="4" class="empty-state">No records in this range</td></tr>`;return;}
+    tbody.innerHTML=rows.map(r=>{
+      const entries=getEntries(r);
+      const status=!entries.length?"Absent":entries.every(e=>e.out)?"Completed":"Checked In";
+      const entryHtml=entries.length?entries.map((e,i)=>`<div style="font-size:11.5px;font-family:var(--mono)">${i+1}. ${fmt12(e.in)} → ${e.out?fmt12(e.out):"in progress"}</div>`).join(""):"-";
+      return `<tr><td class="mono">${r.date}</td><td>${entryHtml}</td><td class="mono">${fmtHours(r)}</td><td><span class="sbadge sbadge-${status.toLowerCase().replace(" ","-")}">${status}</span></td></tr>`;
+    }).join("");
+  }catch(e){tbody.innerHTML=`<tr><td colspan="4" class="empty-state">Error: ${e.message}</td></tr>`;}
+};
+window.exportStaffCSV = async () => {
+  const from=$("hist-from").value, to=$("hist-to").value;
+  if(!from||!to||from>to){showToast("Check date range","warn");return;}
+  try{
+    const q=query(collection(db,"attendance"),where("staffId","==",histId));
+    const docs=(await getDocs(q)).docs.map(d=>d.data())
+      .filter(r=>r.adminUid===currentUser.uid&&r.date>=from&&r.date<=to)
+      .sort((a,b)=>b.date.localeCompare(a.date));
+    if(!docs.length){showToast("No records to export","warn");return;}
+    const rows=[["Date","Name","Entry#","Check In","Check Out","Hours","Status"]];
+    docs.forEach(r=>{
+      const entries=getEntries(r);
+      if(!entries.length){rows.push([r.date,histName,"—","—","—","—","Absent"]);}
+      else entries.forEach((e,i)=>rows.push([r.date,histName,i+1,e.in?fmt12(e.in):"",e.out?fmt12(e.out):"",e.in&&e.out?getDuration(e.in,e.out):"",!e.out?"Checked In":"Completed"]));
+    });
+    downloadCSV(rows,`${histName.replace(/\s+/g,"_")}_${from}_to_${to}.csv`);
+    showToast("CSV exported","success");
+  }catch(e){showToast("Export failed","error");}
+};
+
+// ── STAFF DASHBOARD ───────────────────────────────────────────────────────────
+async function loadStaffDashboard() {
+  showSection("staff-section");
+  $("staff-welcome").textContent=staffProfile.name;
+  $("staff-initials-big").textContent=initials(staffProfile.name);
+  $("staff-role").textContent=staffProfile.designation||"";
+  $("staff-shift").textContent=`Shift: ${staffProfile.shiftStart} – ${staffProfile.shiftEnd}`;
+  $("staff-date").textContent=todayFull();
+  startClock("staff-clock");
+  listenStaffLog();
+  // fetch society name
+  if(staffProfile.adminUid){
+    const as=await getDoc(doc(db,"admins",staffProfile.adminUid));
+    $("staff-society-name").textContent=as.exists()?as.data().society:"Your Society";
+  }
+  loadMyHistory();
+}
+
+function listenStaffLog() {
+  const ref=doc(db,"attendance",`${staffProfile.id}_${dayKey()}`);
+  onSnapshot(ref,snap=>updateStaffUI(snap.exists()?snap.data():{}));
+}
+
+function updateStaffUI(log) {
+  const entries=getEntries(log), last=lastEntry(log);
+  $("display-in").textContent  = entries.length?fmt12(entries[0].in):"—";
+  $("display-out").textContent = last&&last.out?fmt12(last.out):entries.length?"In progress":"—";
+  // show all today's pairs
+  const todayEl=$("today-entries");
+  if(entries.length){
+    todayEl.innerHTML=entries.map((e,i)=>`<div class="mono" style="font-size:12px;color:var(--muted)">${i+1}. ${fmt12(e.in)} → ${e.out?fmt12(e.out):`<b style="color:var(--teal)">now</b>`}</div>`).join("");
+    todayEl.style.display="block";
+  } else {
+    todayEl.style.display="none";
+  }
+  $("btn-checkin").disabled  = !canCheckIn(log);
+  $("btn-checkout").disabled = !canCheckOut(log);
+}
+
+async function loadMyHistory() {
+  const el=$("my-history-list"); if(!el) return;
+  el.innerHTML=`<div class="empty-state">Loading…</div>`;
+  try{
+    const q=query(collection(db,"attendance"),where("staffId","==",staffProfile.id));
+    const rows=(await getDocs(q)).docs.map(d=>d.data()).sort((a,b)=>b.date.localeCompare(a.date)).slice(0,30);
+    if(!rows.length){el.innerHTML=`<div class="empty-state">No attendance records yet</div>`;return;}
+    el.innerHTML=rows.map(r=>{
+      const entries=getEntries(r);
+      const status=!entries.length?"Absent":entries.every(e=>e.out)?"Completed":"Checked In";
+      const entryHtml=entries.length?entries.map((e,i)=>`<div class="mono" style="font-size:11.5px">${i+1}. ${fmt12(e.in)} → ${e.out?fmt12(e.out):`<b style="color:var(--teal)">now</b>`}</div>`).join(""):"-";
+      return `<div class="hist-row"><div style="flex:1"><div class="hist-date">${r.date}</div>${entryHtml}</div><div style="text-align:right"><div class="mono" style="font-weight:700;font-size:13px">${fmtHours(r)}</div><span class="sbadge sbadge-${status.toLowerCase().replace(" ","-")}" style="margin-top:5px;display:inline-block">${status}</span></div></div>`;
+    }).join("");
+  }catch(e){el.innerHTML=`<div class="empty-state">Couldn't load history</div>`;}
+}
+
+window.exportMyCSV = async () => {
+  try{
+    const q=query(collection(db,"attendance"),where("staffId","==",staffProfile.id));
+    const docs=(await getDocs(q)).docs.map(d=>d.data()).sort((a,b)=>b.date.localeCompare(a.date));
+    if(!docs.length){showToast("No records to export","warn");return;}
+    const adminSnap=staffProfile.adminUid?await getDoc(doc(db,"admins",staffProfile.adminUid)):null;
+    const society=adminSnap?.exists()?adminSnap.data().society:"";
+    const rows=[["Date","Entry#","Check In","Check Out","Hours","Status","Society"]];
+    docs.forEach(r=>{
+      const entries=getEntries(r);
+      if(!entries.length){rows.push([r.date,"—","—","—","—","Absent",society]);}
+      else entries.forEach((e,i)=>rows.push([r.date,i+1,e.in?fmt12(e.in):"",e.out?fmt12(e.out):"",e.in&&e.out?getDuration(e.in,e.out):"",!e.out?"Checked In":"Completed",society]));
+    });
+    downloadCSV(rows,`my_attendance_${staffProfile.name.replace(/\s+/g,"_")}.csv`);
+    showToast("Your attendance exported","success");
+  }catch(e){showToast("Export failed","error");}
+};
+
+// ── CONFIRM CHECK-IN / CHECK-OUT ──────────────────────────────────────────────
+let pendingAction=null;
+window.askCheckIn  = () => openConfirm("in");
+window.askCheckOut = () => openConfirm("out");
+function openConfirm(action) {
+  pendingAction=action;
+  $("confirm-title").textContent=action==="in"?"Confirm Entry":"Confirm Exit";
+  $("confirm-desc").textContent=action==="in"?"Marking your check-in time as:":"Marking your check-out time as:";
+  $("confirm-time").textContent=new Date().toLocaleTimeString("en-IN",{hour:"2-digit",minute:"2-digit",second:"2-digit"});
+  const btn=$("confirm-btn");
+  btn.textContent=action==="in"?"✅ Confirm Entry":"🏁 Confirm Exit";
+  btn.className="btn "+(action==="in"?"btn-primary":"btn-danger");
+  $("confirm-modal").classList.remove("hidden");
+}
+window.closeConfirm = () => { $("confirm-modal").classList.add("hidden"); pendingAction=null; };
+window.doConfirm = async () => {
+  if(!pendingAction) return;
+  const action=pendingAction;
+  const btn=$("confirm-btn"); btn.disabled=true; btn.textContent="Saving…";
+  try{
+    if(action==="in") await doCheckIn();
+    else await doCheckOut();
+    await notifyAdmin(action);
+  }finally{
+    btn.disabled=false;
+    window.closeConfirm();
+    loadMyHistory();
+  }
+};
+
+async function doCheckIn() {
+  const key=dayKey(), now=new Date().toISOString(), logId=`${staffProfile.id}_${key}`;
+  await setDoc(doc(db,"attendance",logId),{
+    staffId:staffProfile.id, staffName:staffProfile.name, staffEmail:staffProfile.email,
+    date:key, adminUid:staffProfile.adminUid, entries:arrayUnion({in:now,out:null})
+  },{merge:true});
+  showToast("✅ Checked in at "+fmt12(now),"success");
+}
+async function doCheckOut() {
+  const key=dayKey(), now=new Date().toISOString(), logId=`${staffProfile.id}_${key}`;
+  const snap=await getDoc(doc(db,"attendance",logId));
+  if(!snap.exists()){showToast("No check-in found for today","warn");return;}
+  const entries=[...(snap.data().entries||[])];
+  const idx=entries.map(e=>e.out).lastIndexOf(null);
+  if(idx===-1){showToast("No open entry to close","warn");return;}
+  entries[idx]={...entries[idx],out:now};
+  await updateDoc(doc(db,"attendance",logId),{entries});
+  showToast("🏁 Checked out at "+fmt12(now),"info");
+}
+async function notifyAdmin(action) {
+  try{
+    const key=dayKey(), snap=await getDoc(doc(db,"attendance",`${staffProfile.id}_${key}`));
+    if(!snap.exists()) return;
+    const entries=snap.data().entries||[];
+    const time=action==="in"?fmt12(entries[entries.length-1]?.in):fmt12(entries[entries.length-1]?.out);
+    if(!staffProfile.adminUid) return;
+    const as=await getDoc(doc(db,"admins",staffProfile.adminUid));
+    if(!as.exists()) return;
+    await sendEmail({staffName:staffProfile.name,staffEmail:staffProfile.email,action,time,adminEmail:as.data().email,societyName:as.data().society});
+  }catch(e){console.error(e);}
+}
+
+// ── CSV helper ────────────────────────────────────────────────────────────────
+function downloadCSV(rows,filename) {
+  const csv=rows.map(r=>r.map(v=>`"${v}"`).join(",")).join("\n");
+  const a=document.createElement("a");
+  a.href="data:text/csv;charset=utf-8,"+encodeURIComponent(csv);
+  a.download=filename; a.click();
+}
+</script>
+<style>
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0;}
+:root{
+  --bg:#EEE9FB;
+  --surface:#FFFFFF;
+  --card:#FFFFFF;
+  --accent:#6D28D9;
+  --accent-g:linear-gradient(90deg,#7C3AED,#6D28D9);
+  --accent2:#E94F8A;
+  --teal:#0D9488;
+  --amber:#D97706;
+  --text:#1F1B33;
+  --muted:#6B6480;
+  --border:#E4DEF7;
+  --radius:14px;
+  --mono:'JetBrains Mono','SF Mono',Consolas,monospace;
+}
+body{background:linear-gradient(180deg,#E8E1F9 0%,#F0ECF8 60%,#EAE5F7 100%);color:var(--text);font-family:'Inter',system-ui,sans-serif;min-height:100vh;}
+.hidden{display:none!important;}
+a{color:var(--accent);text-decoration:none;font-weight:600;}
+
+/* ── toast ── */
+.toast{position:fixed;bottom:24px;left:50%;transform:translateX(-50%) translateY(20px);background:var(--card);border:1px solid var(--border);color:var(--text);padding:12px 20px;border-radius:40px;font-size:13.5px;font-weight:600;opacity:0;transition:.3s;z-index:9999;white-space:nowrap;box-shadow:0 8px 32px rgba(109,40,217,.18);}
+.toast.show{opacity:1;transform:translateX(-50%) translateY(0);}
+.toast-success{border-color:var(--teal);}
+.toast-error{border-color:var(--accent2);}
+.toast-warn{border-color:var(--amber);}
+
+/* ── topnav ── */
+.topnav{background:var(--surface);border-bottom:1px solid var(--border);position:sticky;top:0;z-index:10;}
+.topnav-inner{max-width:980px;margin:0 auto;padding:14px 20px;display:flex;justify-content:space-between;align-items:center;}
+.logo{display:flex;align-items:center;gap:10px;}
+.logo-mark{width:36px;height:36px;border-radius:10px;background:var(--accent-g);display:flex;align-items:center;justify-content:center;font-size:18px;}
+.logo-text{font-weight:800;font-size:16px;}
+.logo-sub{font-size:11px;color:var(--muted);}
+.nav-right{display:flex;align-items:center;gap:8px;}
+.nav-clock{font-family:var(--mono);font-size:13px;color:var(--accent);}
+.btn-guide{background:var(--accent-g);color:#fff;border:none;border-radius:8px;padding:7px 13px;font-size:13px;font-weight:700;cursor:pointer;box-shadow:0 4px 12px rgba(109,40,217,.25);}
+.btn-guide:hover{filter:brightness(1.1);}
+.btn-signout{background:transparent;border:1px solid var(--border);border-radius:8px;padding:7px 12px;color:var(--muted);font-size:13px;cursor:pointer;transition:.2s;}
+.btn-signout:hover{border-color:var(--accent2);color:var(--accent2);}
+
+/* ── auth page ── */
+#auth-section{display:flex;flex-direction:column;align-items:center;justify-content:center;min-height:100vh;padding:24px;}
+.auth-hero{text-align:center;margin-bottom:28px;}
+.auth-pill{display:inline-flex;align-items:center;gap:10px;background:linear-gradient(90deg,#7C3AED,#0D9488);padding:10px 22px;border-radius:999px;box-shadow:0 10px 26px rgba(109,40,217,.25);margin-bottom:20px;}
+.auth-pill span{color:#fff;font-weight:800;font-size:13px;letter-spacing:.06em;}
+.auth-headline{font-size:30px;font-weight:800;line-height:1.15;background:linear-gradient(90deg,#6D28D9,#E94F8A);-webkit-background-clip:text;background-clip:text;color:transparent;margin-bottom:10px;}
+.auth-sub-text{color:var(--muted);font-size:13.5px;max-width:320px;margin:0 auto 18px;}
+.auth-chips{display:flex;flex-wrap:wrap;justify-content:center;gap:8px;margin-bottom:0;}
+.chip{font-weight:700;font-size:12.5px;padding:7px 14px;border-radius:999px;}
+.chip-purple{background:#EDE9FE;color:#6D28D9;}
+.chip-teal{background:#CCFBF1;color:#0D9488;}
+.chip-pink{background:#FCE7F3;color:#BE185D;}
+.chip-amber{background:#FEF3C7;color:#B45309;}
+
+.auth-card{background:var(--surface);border:1px solid var(--border);border-radius:24px;padding:36px 32px;width:100%;max-width:420px;box-shadow:0 20px 50px rgba(109,40,217,.12);}
+.tab-bar{display:flex;gap:4px;margin-bottom:24px;background:var(--bg);border-radius:10px;padding:4px;}
+.tab-btn{flex:1;border:none;background:transparent;color:var(--muted);padding:9px;border-radius:8px;font-size:13px;font-weight:600;cursor:pointer;transition:.2s;}
+.tab-btn.active{background:var(--card);color:var(--text);}
+.auth-panel{display:flex;flex-direction:column;gap:12px;}
+.divider{text-align:center;color:var(--muted);font-size:12px;margin:4px 0;}
+.register-note{background:rgba(109,40,217,.06);border:1px solid rgba(109,40,217,.18);border-radius:10px;padding:12px 14px;font-size:13px;color:var(--muted);}
+
+/* ── form controls ── */
+.fgroup{display:flex;flex-direction:column;gap:5px;}
+.fgroup label{font-size:12px;color:var(--muted);font-weight:600;text-transform:uppercase;letter-spacing:.04em;}
+input,select{background:var(--bg);border:1px solid var(--border);border-radius:9px;padding:11px 14px;color:var(--text);font-size:14px;font-family:inherit;transition:.2s;outline:none;width:100%;}
+input:focus,select:focus{border-color:var(--accent);box-shadow:0 0 0 3px rgba(109,40,217,.12);}
+input[type="time"],input[type="date"]{font-family:var(--mono);}
+
+/* ── buttons ── */
+.btn{border:none;border-radius:10px;padding:12px 18px;font-size:14px;font-weight:700;cursor:pointer;display:flex;align-items:center;justify-content:center;gap:7px;transition:.2s;width:100%;}
+.btn-primary{background:var(--accent-g);color:#fff;box-shadow:0 8px 20px rgba(109,40,217,.28);}
+.btn-primary:hover{filter:brightness(1.08);}
+.btn-secondary{background:var(--card);color:var(--text);border:1px solid var(--border);}
+.btn-secondary:hover{border-color:var(--accent);}
+.btn-danger{background:rgba(233,79,138,.12);color:var(--accent2);border:1px solid var(--accent2);}
+.btn-google{background:#fff;color:#1F1B33;border:1px solid #E0E0E0;}
+.btn:disabled{opacity:.4;cursor:not-allowed;}
+.icon-btn{background:var(--card);border:1px solid var(--border);border-radius:8px;padding:7px 10px;cursor:pointer;font-size:15px;}
+.edit-btn{background:rgba(13,148,136,.1);border-color:var(--teal);}
+.del-btn{background:rgba(233,79,138,.1);border-color:var(--accent2);}
+
+/* ── inner wrap ── */
+.inner-wrap{max-width:980px;margin:0 auto;padding:28px 20px;}
+.page-title{font-size:22px;font-weight:800;margin-bottom:4px;}
+.page-sub{font-size:13px;color:var(--muted);margin-bottom:24px;}
+
+/* ── admin tabs ── */
+.tab-row{display:flex;gap:6px;margin-bottom:24px;}
+.adm-tab-btn{border:1px solid var(--border);background:var(--surface);color:var(--muted);border-radius:9px;padding:9px 18px;font-size:13px;font-weight:600;cursor:pointer;transition:.2s;}
+.adm-tab-btn.active{background:var(--accent-g);color:#fff;border-color:transparent;box-shadow:0 6px 16px rgba(109,40,217,.25);}
+
+/* ── summary cards ── */
+.summary-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;margin-bottom:22px;}
+.sum-card{background:var(--card);border:1px solid var(--border);border-radius:var(--radius);padding:16px 18px;box-shadow:0 4px 16px rgba(31,27,51,.05);}
+.sum-label{font-size:11px;font-weight:700;color:var(--muted);text-transform:uppercase;letter-spacing:.05em;margin-bottom:8px;}
+.sum-value{font-family:var(--mono);font-size:32px;font-weight:700;}
+.val-green{color:var(--teal);}
+.val-amber{color:var(--amber);}
+.val-red{color:var(--accent2);}
+
+/* ── table ── */
+.tbl-wrap{background:var(--card);border:1px solid var(--border);border-radius:var(--radius);overflow:auto;box-shadow:0 4px 20px rgba(31,27,51,.05);}
+table{width:100%;border-collapse:collapse;font-size:13.5px;}
+th{text-align:left;padding:12px 16px;font-size:11px;font-weight:700;color:var(--muted);text-transform:uppercase;letter-spacing:.04em;border-bottom:1px solid var(--border);white-space:nowrap;}
+td{padding:13px 16px;border-bottom:1px solid var(--border);vertical-align:middle;}
+tr:last-child td{border-bottom:none;}
+.mono{font-family:var(--mono);}
+.late-tag{margin-left:7px;font-size:10px;font-weight:700;background:rgba(217,119,6,.15);color:var(--amber);padding:2px 7px;border-radius:5px;}
+.sbadge{font-size:11.5px;font-weight:600;padding:4px 10px;border-radius:6px;}
+.sbadge-absent{background:rgba(233,79,138,.1);color:var(--accent2);}
+.sbadge-checked-in{background:rgba(217,119,6,.12);color:var(--amber);}
+.sbadge-completed{background:rgba(13,148,136,.12);color:var(--teal);}
+.empty-state{padding:36px;text-align:center;color:var(--muted);font-size:14px;}
+
+/* ── staff manage cards ── */
+.staff-card{background:var(--card);border:1px solid var(--border);border-radius:var(--radius);padding:16px;display:flex;align-items:center;gap:14px;margin-bottom:10px;box-shadow:0 3px 12px rgba(31,27,51,.04);}
+.staff-clickable{cursor:pointer;transition:transform .15s,box-shadow .15s;}
+.staff-clickable:hover{transform:translateY(-2px);box-shadow:0 10px 26px rgba(109,40,217,.12);border-color:#D8CCF7;}
+.savatar{width:44px;height:44px;border-radius:50%;background:var(--accent-g);display:flex;align-items:center;justify-content:center;font-weight:800;font-size:15px;color:#fff;flex-shrink:0;}
+.staff-info{flex:1;}
+.staff-name{font-weight:700;font-size:15px;}
+.staff-meta{font-size:12px;color:var(--muted);margin-top:2px;}
+.staff-actions{display:flex;gap:8px;}
+.add-form{background:var(--card);border:1px solid var(--border);border-radius:var(--radius);padding:22px;margin-bottom:22px;box-shadow:0 3px 12px rgba(31,27,51,.04);}
+.add-form h3{font-size:15px;margin-bottom:16px;}
+.form-row{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:12px;}
+@media(max-width:600px){.form-row{grid-template-columns:1fr;}}
+.row-between{display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;flex-wrap:wrap;gap:10px;}
+.sec-title{font-size:15px;font-weight:700;margin-bottom:14px;}
+
+/* ── staff dashboard ── */
+.staff-hero{background:var(--card);border:1px solid var(--border);border-radius:var(--radius);padding:28px;text-align:center;margin-bottom:22px;box-shadow:0 4px 20px rgba(109,40,217,.08);}
+.big-avatar{width:70px;height:70px;border-radius:50%;background:var(--accent-g);display:flex;align-items:center;justify-content:center;font-weight:800;font-size:26px;color:#fff;margin:0 auto 14px;}
+.big-clock{font-family:var(--mono);font-size:40px;font-weight:700;color:var(--accent);margin:10px 0;}
+.time-grid{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-bottom:16px;}
+.time-box{background:var(--bg);border:1px solid var(--border);border-radius:12px;padding:16px;text-align:center;}
+.time-label{font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.05em;font-weight:600;}
+.time-value{font-family:var(--mono);font-size:20px;font-weight:700;margin-top:6px;}
+.action-row{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:14px;}
+.today-entries{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:12px 14px;margin-bottom:14px;}
+.info-box{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:14px 16px;font-size:13px;color:var(--muted);margin-bottom:22px;}
+.hist-row{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:12px 14px;display:flex;align-items:flex-start;gap:12px;margin-bottom:8px;box-shadow:0 2px 10px rgba(31,27,51,.03);}
+.hist-date{font-weight:700;font-size:13px;margin-bottom:3px;}
+@media(max-width:480px){.action-row,.time-grid{grid-template-columns:1fr;}}
+
+/* ── modals ── */
+.modal-overlay{position:fixed;inset:0;background:rgba(31,27,51,.52);display:flex;align-items:center;justify-content:center;padding:20px;z-index:200;}
+.modal-box{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:28px;width:100%;max-width:440px;box-shadow:0 24px 60px rgba(31,27,51,.18);}
+.modal-title{font-size:17px;font-weight:800;margin-bottom:20px;}
+.modal-actions{display:flex;gap:10px;margin-top:20px;}
+.hist-modal-box{max-width:620px;}
+.hist-range-row{display:grid;grid-template-columns:1fr 1fr auto auto;gap:10px;align-items:end;margin-bottom:16px;}
+@media(max-width:560px){.hist-range-row{grid-template-columns:1fr 1fr;}}
+
+/* ── guide modal ── */
+.guide-modal-box{max-width:660px;max-height:88vh;overflow-y:auto;padding:0;position:relative;}
+.guide-header{background:linear-gradient(120deg,#7C3AED,#E94F8A);padding:26px 28px 20px;border-radius:var(--radius) var(--radius) 0 0;color:#fff;position:sticky;top:0;z-index:1;}
+.guide-header h2{font-size:20px;font-weight:800;margin-bottom:4px;}
+.guide-header p{font-size:13px;opacity:.85;}
+.guide-close-btn{position:absolute;top:16px;right:18px;background:rgba(255,255,255,.2);border:none;color:#fff;border-radius:50%;width:30px;height:30px;font-size:16px;cursor:pointer;display:flex;align-items:center;justify-content:center;}
+.guide-body{padding:24px 28px 28px;}
+.g-section{margin-bottom:28px;}
+.g-section:last-child{margin-bottom:0;}
+.g-section-title{font-size:12.5px;font-weight:800;text-transform:uppercase;letter-spacing:.06em;color:var(--accent);margin-bottom:12px;padding-bottom:6px;border-bottom:2px solid var(--border);}
+.g-item{display:flex;gap:12px;margin-bottom:12px;align-items:flex-start;}
+.g-icon{width:34px;height:34px;border-radius:9px;flex-shrink:0;display:flex;align-items:center;justify-content:center;font-size:16px;}
+.gi-purple{background:#EDE9FE;} .gi-teal{background:#CCFBF1;} .gi-pink{background:#FCE7F3;} .gi-amber{background:#FEF3C7;} .gi-green{background:#DCFCE7;} .gi-blue{background:#DBEAFE;}
+.g-item-title{font-weight:700;font-size:14px;margin-bottom:3px;}
+.g-item-desc{font-size:13px;color:var(--muted);line-height:1.55;}
+.g-badge{display:inline-block;font-size:11px;font-weight:700;padding:2px 8px;border-radius:5px;margin-left:5px;}
+.gb-admin{background:#EDE9FE;color:#6D28D9;} .gb-staff{background:#CCFBF1;color:#0D9488;} .gb-both{background:#FEF3C7;color:#B45309;}
+.g-role-card{border-radius:12px;padding:16px;margin-bottom:12px;border:1px solid var(--border);}
+.g-admin-card{background:#F5F3FF;border-color:#DDD6FE;}
+.g-staff-card{background:#F0FDFA;border-color:#99F6E4;}
+.g-role-title{font-weight:800;font-size:14px;margin-bottom:10px;}
+.g-step{display:flex;gap:10px;align-items:flex-start;margin-bottom:9px;}
+.g-step-num{width:22px;height:22px;border-radius:50%;background:var(--accent);color:#fff;font-size:11px;font-weight:800;display:flex;align-items:center;justify-content:center;flex-shrink:0;margin-top:1px;}
+.g-step-num-t{background:var(--teal);}
+.g-step-text{font-size:13px;color:var(--muted);line-height:1.5;}
+.g-email-box{background:var(--bg);border:1px solid var(--border);border-radius:10px;padding:14px 16px;margin-bottom:10px;}
+.g-email-type{font-weight:700;font-size:13px;margin-bottom:5px;}
+.g-email-desc{font-size:12.5px;color:var(--muted);line-height:1.5;}
+</style>
 </head>
 <body>
 
-<!-- ════════════════════════════════════════════════
-     AUTH SCREEN
-════════════════════════════════════════════════ -->
-<div id="auth-section" class="section">
-  <div style="text-align:center;margin-bottom:32px;">
-    <div style="display:inline-flex;align-items:center;gap:10px;background:linear-gradient(90deg,#7C3AED,#0D9488);padding:10px 22px;border-radius:999px;box-shadow:0 10px 26px rgba(109,40,217,.25);margin-bottom:22px;">
-      <span style="font-size:18px;">🏢</span>
-      <span style="color:#fff;font-weight:800;font-size:13px;letter-spacing:.06em;">SOCIETY ATTENDANCE PORTAL</span>
-    </div>
-    <div style="font-size:30px;font-weight:800;line-height:1.15;background:linear-gradient(90deg,#6D28D9,#E94F8A);-webkit-background-clip:text;background-clip:text;color:transparent;">
-      Track Every<br/>Check-In, Instantly
-    </div>
-    <div style="color:var(--muted);font-size:13.5px;margin-top:10px;max-width:320px;margin-left:auto;margin-right:auto;">
-      Digital attendance management for housing societies — simple, transparent, real-time.
-    </div>
-    <div style="display:flex;flex-wrap:wrap;justify-content:center;gap:8px;margin-top:20px;">
-      <span style="background:#EDE9FE;color:#6D28D9;font-weight:700;font-size:12.5px;padding:7px 14px;border-radius:999px;">⏱️ Live Clock-In</span>
-      <span style="background:#CCFBF1;color:#0D9488;font-weight:700;font-size:12.5px;padding:7px 14px;border-radius:999px;">📊 Daily Records</span>
-      <span style="background:#FCE7F3;color:#BE185D;font-weight:700;font-size:12.5px;padding:7px 14px;border-radius:999px;">📁 Excel Export</span>
-      <span style="background:#FEF3C7;color:#B45309;font-weight:700;font-size:12.5px;padding:7px 14px;border-radius:999px;">🔒 Secure Login</span>
+<!-- ══════════════════ AUTH SCREEN ══════════════════ -->
+<div id="auth-section" class="page-section">
+  <div class="auth-hero">
+    <div class="auth-pill"><span>🏢</span><span>SOCIETY ATTENDANCE PORTAL</span></div>
+    <div class="auth-headline">Track Every<br/>Check-In, Instantly</div>
+    <div class="auth-sub-text">Digital attendance for housing societies — simple, transparent, real-time.</div>
+    <div class="auth-chips">
+      <span class="chip chip-purple">⏱️ Live Clock-In</span>
+      <span class="chip chip-teal">📊 Daily Records</span>
+      <span class="chip chip-pink">📁 Excel Export</span>
+      <span class="chip chip-amber">🔒 Secure Login</span>
     </div>
   </div>
 
@@ -1323,556 +700,263 @@
       <button class="tab-btn" data-tab="register" onclick="showTab('register')">Register Admin</button>
     </div>
 
-    <!-- Login tab -->
-    <div id="tab-login" class="auth-tab-panel">
+    <div id="tab-login" class="auth-panel">
       <button class="btn btn-google" onclick="googleSignIn()">
         <svg width="18" height="18" viewBox="0 0 18 18"><path fill="#4285F4" d="M16.51 8H8.98v3h4.3c-.18 1-.74 1.48-1.6 2.04v2.01h2.6a7.8 7.8 0 0 0 2.38-5.88c0-.57-.05-.66-.15-1.18"/><path fill="#34A853" d="M8.98 17c2.16 0 3.97-.72 5.3-1.94l-2.6-2.01c-.72.48-1.63.76-2.7.76-2.08 0-3.84-1.4-4.47-3.29H1.87v2.08A8 8 0 0 0 8.98 17"/><path fill="#FBBC05" d="M4.51 10.52A4.8 4.8 0 0 1 4.26 9c0-.52.09-1.03.25-1.52V5.4H1.87A8 8 0 0 0 .98 9c0 1.29.31 2.51.89 3.6z"/><path fill="#EA4335" d="M8.98 3.58c1.17 0 2.23.4 3.06 1.2l2.3-2.3A8 8 0 0 0 8.98 1a8 8 0 0 0-7.11 4.39l2.64 2.05c.63-1.89 2.39-3.29 4.47-3.29"/></svg>
         Sign in with Google (Admin / Staff)
       </button>
-      <div class="divider">— or admin email/password —</div>
-      <div class="input-group">
-        <label>Email</label>
-        <input id="login-email" type="email" placeholder="admin@society.com" />
-      </div>
-      <div class="input-group">
-        <label>Password</label>
-        <input id="login-pass" type="password" placeholder="••••••••" />
-      </div>
-      <button class="btn btn-primary" onclick="adminLogin()">Sign In</button>
-      <div style="text-align:center;font-size:12px;color:var(--muted);">
-        <a href="#" onclick="forgotPassword()">Forgot password?</a>
-      </div>
+      <div class="divider">— or admin email / password —</div>
+      <div class="fgroup"><label>Email</label><input id="login-email" type="email" placeholder="admin@society.com"/></div>
+      <div class="fgroup"><label>Password</label><input id="login-pass" type="password" placeholder="••••••••"/></div>
+      <button class="btn btn-primary" onclick="adminLogin()">Sign In →</button>
+      <div style="text-align:center;font-size:12px;"><a href="#" onclick="forgotPassword()">Forgot password?</a></div>
     </div>
 
-    <!-- Register tab -->
-    <div id="tab-register" class="auth-tab-panel hidden">
-      <div style="background:rgba(109,40,217,.06);border:1px solid rgba(109,40,217,.18);border-radius:10px;padding:12px 14px;font-size:13px;color:var(--muted);margin-bottom:4px;">
-        🔒 Register a new <b style="color:var(--text)">Society Admin</b> account. Staff members do NOT register here — admin adds them.
-      </div>
-      <div class="input-group">
-        <label>Society Name</label>
-        <input id="reg-society" type="text" placeholder="e.g. Greenview Residency" />
-      </div>
-      <div class="input-group">
-        <label>Admin Email</label>
-        <input id="reg-email" type="email" placeholder="admin@society.com" />
-      </div>
-      <div class="input-group">
-        <label>Password (min 6 chars)</label>
-        <input id="reg-pass" type="password" placeholder="••••••••" />
-      </div>
+    <div id="tab-register" class="auth-panel hidden">
+      <div class="register-note">🔒 This creates a <b>Society Admin</b> account. Staff members do <b>not</b> register here — admin adds them from the dashboard.</div>
+      <div class="fgroup"><label>Society Name</label><input id="reg-society" type="text" placeholder="e.g. Greenview Residency"/></div>
+      <div class="fgroup"><label>Admin Email</label><input id="reg-email" type="email" placeholder="admin@society.com"/></div>
+      <div class="fgroup"><label>Password (min 6 chars)</label><input id="reg-pass" type="password" placeholder="••••••••"/></div>
       <button class="btn btn-primary" onclick="adminRegister()">Create Admin Account</button>
     </div>
   </div>
 </div>
 
-<!-- ════════════════════════════════════════════════
-     ADMIN DASHBOARD
-════════════════════════════════════════════════ -->
-<div id="admin-section" class="section hidden">
+<!-- ══════════════════ ADMIN DASHBOARD ══════════════════ -->
+<div id="admin-section" class="page-section hidden">
   <nav class="topnav">
     <div class="topnav-inner">
       <div class="logo">
         <div class="logo-mark">🏢</div>
-        <div>
-          <div class="logo-text" id="admin-society">Society</div>
-          <div class="logo-sub" id="admin-email-display"></div>
-        </div>
+        <div><div class="logo-text" id="admin-society">Society</div><div class="logo-sub" id="admin-email-lbl"></div></div>
       </div>
-      <div class="user-pill">
-        <div id="live-clock" style="font-family:var(--mono);font-size:13px;color:var(--accent);"></div>
-        <button class="help-btn" onclick="openGuide()">❓ Guide</button>
-        <button class="signout-btn" onclick="doSignOut()">Sign out</button>
+      <div class="nav-right">
+        <div class="nav-clock" id="admin-clock"></div>
+        <button class="btn-guide" onclick="openGuide()">❓ Guide</button>
+        <button class="btn-signout" onclick="doSignOut()">Sign out</button>
       </div>
     </div>
   </nav>
-
-  <div class="inner-wrap" style="max-width:960px;margin:0 auto;padding:28px 20px;">
+  <div class="inner-wrap">
     <div class="page-title">Admin Dashboard</div>
     <div class="page-sub" id="admin-date"></div>
-
     <div class="tab-row">
-      <button class="admin-tab-btn active" data-admin-tab="attendance" onclick="showAdminTab('attendance')">📋 Attendance</button>
-      <button class="admin-tab-btn" data-admin-tab="staff" onclick="showAdminTab('staff')">👥 Manage Staff</button>
+      <button class="adm-tab-btn active" data-atab="attendance" onclick="showAdminTab('attendance')">📋 Attendance</button>
+      <button class="adm-tab-btn" data-atab="staff" onclick="showAdminTab('staff')">👥 Manage Staff</button>
     </div>
 
     <!-- Attendance panel -->
-    <div id="admin-panel-attendance" class="admin-panel">
+    <div id="apanel-attendance" class="admin-panel">
       <div class="summary-grid">
-        <div class="summary-card">
-          <div class="summary-label">Total Staff</div>
-          <div class="summary-value" id="card-total">—</div>
-        </div>
-        <div class="summary-card">
-          <div class="summary-label">Present</div>
-          <div class="summary-value green" id="card-present">—</div>
-        </div>
-        <div class="summary-card">
-          <div class="summary-label">Late</div>
-          <div class="summary-value amber" id="card-late">—</div>
-        </div>
-        <div class="summary-card">
-          <div class="summary-label">Absent</div>
-          <div class="summary-value red" id="card-absent">—</div>
-        </div>
+        <div class="sum-card"><div class="sum-label">Total Staff</div><div class="sum-value" id="card-total">—</div></div>
+        <div class="sum-card"><div class="sum-label">Present</div><div class="sum-value val-green" id="card-present">—</div></div>
+        <div class="sum-card"><div class="sum-label">Late</div><div class="sum-value val-amber" id="card-late">—</div></div>
+        <div class="sum-card"><div class="sum-label">Absent</div><div class="sum-value val-red" id="card-absent">—</div></div>
       </div>
-
       <div class="row-between">
-        <div class="section-title" style="margin:0">Today's Records</div>
-        <button class="btn btn-secondary" style="width:auto;padding:9px 16px;" onclick="exportCSV()">⬇ Export CSV</button>
+        <div class="sec-title" style="margin:0">Today's Records</div>
+        <button class="btn btn-secondary" style="width:auto;padding:9px 16px" onclick="exportTodayCSV()">⬇ Export CSV</button>
       </div>
-
-      <div class="table-wrap">
+      <div class="tbl-wrap">
         <table>
-          <thead>
-            <tr>
-              <th>Name</th><th>Designation</th><th>Shift</th>
-              <th>Today's Entries</th><th>Total Hours</th><th>Status</th>
-            </tr>
-          </thead>
-          <tbody id="attendance-tbody">
-            <tr><td colspan="6" class="empty-state">Loading…</td></tr>
-          </tbody>
+          <thead><tr><th>Name</th><th>Designation</th><th>Shift</th><th>Today's Entries</th><th>Total Hours</th><th>Status</th></tr></thead>
+          <tbody id="attendance-tbody"><tr><td colspan="6" class="empty-state">Loading…</td></tr></tbody>
         </table>
       </div>
     </div>
 
-    <!-- Staff panel -->
-    <div id="admin-panel-staff" class="admin-panel hidden">
+    <!-- Manage Staff panel -->
+    <div id="apanel-staff" class="admin-panel hidden">
       <div class="add-form">
         <h3>➕ Add New Staff Member</h3>
         <div class="form-row">
-          <div class="input-group">
-            <label>Full Name</label>
-            <input id="new-name" type="text" placeholder="e.g. Ravi Kumar" />
-          </div>
-          <div class="input-group">
-            <label>Email (used to login)</label>
-            <input id="new-email" type="email" placeholder="ravi@gmail.com" />
-          </div>
+          <div class="fgroup"><label>Full Name</label><input id="new-name" type="text" placeholder="e.g. Ravi Kumar"/></div>
+          <div class="fgroup"><label>Email (used to login)</label><input id="new-email" type="email" placeholder="ravi@gmail.com"/></div>
         </div>
         <div class="form-row">
-          <div class="input-group">
-            <label>Designation</label>
-            <input id="new-desig" type="text" placeholder="e.g. Security Guard" />
-          </div>
-          <div class="input-group" style="display:grid;grid-template-columns:1fr 1fr;gap:8px;">
-            <div class="input-group">
-              <label>Shift Start</label>
-              <input id="new-shift-start" type="time" value="09:00" />
-            </div>
-            <div class="input-group">
-              <label>Shift End</label>
-              <input id="new-shift-end" type="time" value="18:00" />
-            </div>
+          <div class="fgroup"><label>Designation</label><input id="new-desig" type="text" placeholder="e.g. Security Guard"/></div>
+          <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;">
+            <div class="fgroup"><label>Shift Start</label><input id="new-shift-start" type="time" value="09:00"/></div>
+            <div class="fgroup"><label>Shift End</label><input id="new-shift-end" type="time" value="18:00"/></div>
           </div>
         </div>
         <button class="btn btn-primary" onclick="addStaff()">Add Staff Member</button>
       </div>
-
-      <div class="section-title">All Staff</div>
-      <div id="staff-list-admin">
-        <div class="empty-state">Loading staff…</div>
-      </div>
+      <div class="sec-title">All Staff <span style="font-size:12px;color:var(--muted);font-weight:400">(click a card to view their full attendance history)</span></div>
+      <div id="staff-list-admin"><div class="empty-state">Loading…</div></div>
     </div>
   </div>
 </div>
 
-<!-- ════════════════════════════════════════════════
-     STAFF DASHBOARD
-════════════════════════════════════════════════ -->
-<div id="staff-section" class="section hidden">
+<!-- ══════════════════ STAFF DASHBOARD ══════════════════ -->
+<div id="staff-section" class="page-section hidden">
   <nav class="topnav">
     <div class="topnav-inner">
       <div class="logo">
         <div class="logo-mark">👤</div>
-        <div>
-          <div class="logo-text" id="staff-society-name">My Attendance</div>
-          <div class="logo-sub">Staff Portal</div>
-        </div>
+        <div><div class="logo-text" id="staff-society-name">My Attendance</div><div class="logo-sub">Staff Portal</div></div>
       </div>
-      <div class="user-pill">
-        <button class="help-btn" onclick="openGuide()">❓ Guide</button>
-        <button class="signout-btn" onclick="doSignOut()">Sign out</button>
+      <div class="nav-right">
+        <button class="btn-guide" onclick="openGuide()">❓ Guide</button>
+        <button class="btn-signout" onclick="doSignOut()">Sign out</button>
       </div>
     </div>
   </nav>
-
-  <div class="inner-wrap" style="max-width:520px;margin:0 auto;padding:28px 20px;">
+  <div class="inner-wrap" style="max-width:520px;">
     <div class="staff-hero">
-      <div class="big-avatar" id="staff-initials">?</div>
-      <div style="font-size:22px;font-weight:800;" id="staff-welcome">Staff</div>
-      <div style="color:var(--muted);font-size:13px;" id="staff-role"></div>
-      <div style="color:var(--muted);font-size:12px;margin-top:2px;" id="staff-shift"></div>
-      <div class="big-clock" id="staff-live-clock"></div>
-      <div style="font-size:13px;color:var(--muted);" id="staff-date"></div>
+      <div class="big-avatar" id="staff-initials-big">?</div>
+      <div style="font-size:22px;font-weight:800" id="staff-welcome">Staff</div>
+      <div style="color:var(--muted);font-size:13px" id="staff-role"></div>
+      <div style="color:var(--muted);font-size:12px;margin-top:2px" id="staff-shift"></div>
+      <div class="big-clock" id="staff-clock"></div>
+      <div style="font-size:13px;color:var(--muted)" id="staff-date"></div>
     </div>
 
     <div class="time-grid">
-      <div class="time-box">
-        <div class="time-label">First In</div>
-        <div class="time-value" id="display-in" style="color:var(--accent);">—</div>
-      </div>
-      <div class="time-box">
-        <div class="time-label">Last Out</div>
-        <div class="time-value" id="display-out" style="color:var(--accent2);">—</div>
-      </div>
+      <div class="time-box"><div class="time-label">First In</div><div class="time-value" id="display-in" style="color:var(--accent)">—</div></div>
+      <div class="time-box"><div class="time-label">Last Out</div><div class="time-value" id="display-out" style="color:var(--accent2)">—</div></div>
     </div>
 
-    <!-- Today's all entry/exit pairs shown inline -->
-    <div id="today-entries" style="display:none;background:var(--card);border:1px solid var(--border);border-radius:12px;padding:12px 14px;margin-bottom:14px;"></div>
+    <div id="today-entries" class="today-entries" style="display:none"></div>
 
     <div class="action-row">
-      <button class="btn btn-primary" id="btn-checkin" onclick="askConfirmCheckIn()">✅ Check In</button>
-      <button class="btn btn-danger"  id="btn-checkout" onclick="askConfirmCheckOut()" disabled>🏁 Check Out</button>
+      <button class="btn btn-primary" id="btn-checkin" onclick="askCheckIn()">✅ Check In</button>
+      <button class="btn btn-danger" id="btn-checkout" onclick="askCheckOut()" disabled>🏁 Check Out</button>
     </div>
 
-    <div style="margin-top:14px;background:var(--card);border:1px solid var(--border);border-radius:12px;padding:14px 16px;font-size:13px;color:var(--muted);">
-      💡 Each check-in/out asks you to confirm first, then automatically emails the society office — no extra steps needed. You can check in and out multiple times in a day.
+    <div class="info-box">
+      💡 Tap <b>Check In</b> when you arrive and <b>Check Out</b> when you leave. A confirmation popup prevents accidental taps. You can check in and out <b>multiple times per day</b> (e.g. after a lunch break). Admin is notified automatically every time.
     </div>
 
-    <div style="display:flex;justify-content:space-between;align-items:center;margin-top:28px;margin-bottom:8px;">
-      <div class="section-title" style="margin:0;">📅 My Attendance History</div>
-      <button class="btn btn-secondary" style="width:auto;padding:9px 14px;font-size:13px;" onclick="exportMyHistoryCSV()">⬇ Export CSV</button>
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;">
+      <div class="sec-title" style="margin:0">📅 My Attendance History</div>
+      <button class="btn btn-secondary" style="width:auto;padding:9px 14px;font-size:13px" onclick="exportMyCSV()">⬇ Export CSV</button>
     </div>
-    <div id="my-history-list" class="history-list">
-      <div class="empty-state">Loading…</div>
-    </div>
+    <div id="my-history-list"><div class="empty-state">Loading…</div></div>
   </div>
 </div>
 
-<!-- ════════════════════════════════════════════════
-     EDIT STAFF MODAL
-════════════════════════════════════════════════ -->
+<!-- ══════════════════ EDIT STAFF MODAL ══════════════════ -->
 <div id="edit-modal" class="modal-overlay hidden" onclick="closeEditModal()">
   <div class="modal-box" onclick="event.stopPropagation()">
     <div class="modal-title">✏️ Edit Staff Details</div>
-    <input id="edit-id" type="hidden" />
+    <input id="edit-id" type="hidden"/>
     <div style="display:flex;flex-direction:column;gap:12px;">
-      <div class="input-group">
-        <label>Full Name</label>
-        <input id="edit-name" type="text" />
-      </div>
-      <div class="input-group">
-        <label>Email (read-only — used for login)</label>
-        <input id="edit-email" type="email" disabled style="opacity:.5;" />
-      </div>
-      <div class="input-group">
-        <label>Designation</label>
-        <input id="edit-desig" type="text" />
-      </div>
+      <div class="fgroup"><label>Full Name</label><input id="edit-name" type="text"/></div>
+      <div class="fgroup"><label>Email (read-only — login key)</label><input id="edit-email" type="email" disabled style="opacity:.5"/></div>
+      <div class="fgroup"><label>Designation</label><input id="edit-desig" type="text"/></div>
       <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;">
-        <div class="input-group">
-          <label>Shift Start</label>
-          <input id="edit-shift-start" type="time" />
-        </div>
-        <div class="input-group">
-          <label>Shift End</label>
-          <input id="edit-shift-end" type="time" />
-        </div>
+        <div class="fgroup"><label>Shift Start</label><input id="edit-shift-start" type="time"/></div>
+        <div class="fgroup"><label>Shift End</label><input id="edit-shift-end" type="time"/></div>
       </div>
     </div>
     <div class="modal-actions">
-      <button class="btn btn-secondary" onclick="closeEditModal()" style="flex:1;">Cancel</button>
-      <button class="btn btn-primary"   onclick="saveEdit()"       style="flex:1;">Save Changes</button>
+      <button class="btn btn-secondary" onclick="closeEditModal()" style="flex:1">Cancel</button>
+      <button class="btn btn-primary" onclick="saveEdit()" style="flex:1">Save Changes</button>
     </div>
   </div>
 </div>
 
-<!-- ════════════════════════════════════════════════
-     STAFF ATTENDANCE HISTORY MODAL
-════════════════════════════════════════════════ -->
-<div id="history-modal" class="modal-overlay hidden" onclick="closeHistoryModal()">
-  <div class="modal-box history-box" onclick="event.stopPropagation()">
+<!-- ══════════════════ STAFF HISTORY MODAL ══════════════════ -->
+<div id="hist-modal" class="modal-overlay hidden" onclick="closeHistModal()">
+  <div class="modal-box hist-modal-box" onclick="event.stopPropagation()">
     <div style="display:flex;align-items:center;gap:12px;margin-bottom:18px;">
-      <div class="staff-avatar" id="history-staff-initials" style="width:40px;height:40px;font-size:13px;">?</div>
-      <div style="flex:1;">
-        <div style="font-weight:800;font-size:16px;" id="history-staff-name">Staff</div>
-        <div style="font-size:12.5px;color:var(--muted);" id="history-staff-desig"></div>
-      </div>
-      <button class="btn-icon" onclick="closeHistoryModal()" style="border:none;background:transparent;font-size:18px;">✕</button>
+      <div class="savatar" id="hist-initials" style="width:40px;height:40px;font-size:13px">?</div>
+      <div style="flex:1"><div style="font-weight:800;font-size:16px" id="hist-name">Staff</div><div style="font-size:12.5px;color:var(--muted)" id="hist-desig"></div></div>
+      <button class="icon-btn" onclick="closeHistModal()" style="border:none;background:transparent;font-size:18px;cursor:pointer">✕</button>
     </div>
-
-    <div class="history-range-row">
-      <div class="input-group">
-        <label>From</label>
-        <input id="history-from" type="date" onchange="loadStaffHistory()" />
-      </div>
-      <div class="input-group">
-        <label>To</label>
-        <input id="history-to" type="date" onchange="loadStaffHistory()" />
-      </div>
-      <button class="btn btn-secondary" style="width:auto;padding:11px 16px;" onclick="loadStaffHistory()">🔍 Search</button>
-      <button class="btn btn-primary" style="width:auto;padding:11px 16px;" onclick="exportStaffHistoryCSV()">⬇ Export</button>
+    <div class="hist-range-row">
+      <div class="fgroup"><label>From</label><input id="hist-from" type="date" onchange="loadStaffHistory()"/></div>
+      <div class="fgroup"><label>To</label><input id="hist-to" type="date" onchange="loadStaffHistory()"/></div>
+      <button class="btn btn-secondary" style="width:auto;padding:11px 16px" onclick="loadStaffHistory()">🔍 Search</button>
+      <button class="btn btn-primary" style="width:auto;padding:11px 16px" onclick="exportStaffCSV()">⬇ Export</button>
     </div>
-
-    <div class="table-wrap" style="margin-top:16px;max-height:340px;overflow-y:auto;">
+    <div class="tbl-wrap" style="max-height:340px;overflow-y:auto;">
       <table>
-        <thead>
-          <tr>
-            <th>Date</th><th>Entries</th><th>Total Hours</th><th>Status</th>
-          </tr>
-        </thead>
-        <tbody id="history-tbody">
-          <tr><td colspan="4" class="empty-state">Loading…</td></tr>
-        </tbody>
+        <thead><tr><th>Date</th><th>Entries</th><th>Total Hours</th><th>Status</th></tr></thead>
+        <tbody id="hist-tbody"><tr><td colspan="4" class="empty-state">Loading…</td></tr></tbody>
       </table>
     </div>
   </div>
 </div>
 
-<!-- ════════════════════════════════════════════════
-     CHECK-IN / CHECK-OUT CONFIRM MODAL (staff)
-════════════════════════════════════════════════ -->
-<div id="confirm-action-modal" class="modal-overlay hidden" onclick="closeConfirmModal()">
-  <div class="modal-box" onclick="event.stopPropagation()" style="text-align:center;">
-    <div id="confirm-action-title" class="modal-title" style="margin-bottom:6px;">Confirm Entry</div>
-    <div id="confirm-action-desc" style="font-size:13.5px;color:var(--muted);margin-bottom:14px;"></div>
-    <div id="confirm-action-time" class="big-clock" style="font-size:30px;margin:0 0 22px;"></div>
+<!-- ══════════════════ CONFIRM CHECK-IN/OUT MODAL ══════════════════ -->
+<div id="confirm-modal" class="modal-overlay hidden" onclick="closeConfirm()">
+  <div class="modal-box" onclick="event.stopPropagation()" style="text-align:center;max-width:340px;">
+    <div id="confirm-title" class="modal-title" style="margin-bottom:6px">Confirm Entry</div>
+    <div id="confirm-desc" style="font-size:13.5px;color:var(--muted);margin-bottom:12px"></div>
+    <div id="confirm-time" class="big-clock" style="font-size:32px;margin:0 0 20px"></div>
     <div style="display:flex;gap:10px;">
-      <button class="btn btn-secondary" onclick="closeConfirmModal()" style="flex:1;">Cancel</button>
-      <button id="confirm-action-btn" class="btn btn-primary" onclick="confirmAction()" style="flex:1.4;">✅ Confirm Entry</button>
+      <button class="btn btn-secondary" onclick="closeConfirm()" style="flex:1">Cancel</button>
+      <button id="confirm-btn" class="btn btn-primary" onclick="doConfirm()" style="flex:1.4">✅ Confirm Entry</button>
     </div>
-    <div style="margin-top:14px;font-size:12px;color:var(--muted);">
-      📧 This will also notify your society admin automatically.
-    </div>
+    <div style="margin-top:12px;font-size:12px;color:var(--muted)">📧 Admin will be notified automatically.</div>
   </div>
 </div>
 
-<!-- ════════════════════════════════════════════════
-     APP GUIDE MODAL
-════════════════════════════════════════════════ -->
+<!-- ══════════════════ GUIDE MODAL ══════════════════ -->
 <div id="guide-modal" class="modal-overlay hidden" onclick="closeGuide()">
-  <div class="modal-box" onclick="event.stopPropagation()" style="position:relative;">
-
-    <!-- Header -->
+  <div class="modal-box guide-modal-box" onclick="event.stopPropagation()">
     <div class="guide-header">
-      <button class="guide-close" onclick="closeGuide()">✕</button>
+      <button class="guide-close-btn" onclick="closeGuide()">✕</button>
       <h2>📖 How to Use This App</h2>
       <p>Society Attendance Portal — complete guide for admins and staff</p>
     </div>
-
     <div class="guide-body">
 
-      <!-- WHO DOES WHAT -->
-      <div class="guide-section">
-        <div class="guide-section-title">👥 Two Roles — One App</div>
-
-        <div class="guide-role-card admin-card">
-          <div class="guide-role-title">🏢 Admin (Society Office)</div>
-          <div class="guide-step">
-            <div class="guide-step-num">1</div>
-            <div class="guide-step-text">Register once using <b>Register Admin</b> tab — enter your society name, email &amp; password. This creates the office account.</div>
-          </div>
-          <div class="guide-step">
-            <div class="guide-step-num">2</div>
-            <div class="guide-step-text">After logging in, go to <b>Manage Staff</b> tab → fill in each staff member's name, their email (the one they'll use to log in), designation, and shift timings → click <b>Add Staff Member</b>.</div>
-          </div>
-          <div class="guide-step">
-            <div class="guide-step-num">3</div>
-            <div class="guide-step-text">The <b>Attendance</b> tab shows today's live records for all staff — updates in real time as staff check in/out from their phones.</div>
-          </div>
-          <div class="guide-step">
-            <div class="guide-step-num">4</div>
-            <div class="guide-step-text">Click any staff card in <b>Manage Staff</b> to open their full date-range history and export it as CSV.</div>
-          </div>
+      <div class="g-section">
+        <div class="g-section-title">👥 Two Roles — One App</div>
+        <div class="g-role-card g-admin-card">
+          <div class="g-role-title">🏢 Admin (Society Office)</div>
+          <div class="g-step"><div class="g-step-num">1</div><div class="g-step-text">Go to <b>Register Admin</b> tab → enter your society name, email and password → create your account. Do this only once.</div></div>
+          <div class="g-step"><div class="g-step-num">2</div><div class="g-step-text">After logging in, click <b>Manage Staff</b> tab → fill in each staff member's name, their email address, designation, and shift times → click <b>Add Staff Member</b>.</div></div>
+          <div class="g-step"><div class="g-step-num">3</div><div class="g-step-text">The <b>Attendance</b> tab shows all staff check-ins for today in real time. Summary cards at the top show Present / Late / Absent counts.</div></div>
+          <div class="g-step"><div class="g-step-num">4</div><div class="g-step-text"><b>Click any staff card</b> in Manage Staff to open their full attendance history. Pick a date range, view all entries, and export to CSV.</div></div>
         </div>
-
-        <div class="guide-role-card staff-card">
-          <div class="guide-role-title">👤 Staff (Housekeeping / Security / etc.)</div>
-          <div class="guide-step">
-            <div class="guide-step-num teal">1</div>
-            <div class="guide-step-text">Open this same link on your phone. Tap <b>Sign in with Google</b> — use the <b>exact same email</b> the admin entered for you when adding you as staff.</div>
-          </div>
-          <div class="guide-step">
-            <div class="guide-step-num teal">2</div>
-            <div class="guide-step-text">Your name, designation, and shift load automatically — no setup needed.</div>
-          </div>
-          <div class="guide-step">
-            <div class="guide-step-num teal">3</div>
-            <div class="guide-step-text">Tap <b>✅ Check In</b> when you arrive. A confirmation popup shows the exact time — tap <b>Confirm Entry</b> to save it.</div>
-          </div>
-          <div class="guide-step">
-            <div class="guide-step-num teal">4</div>
-            <div class="guide-step-text">Tap <b>🏁 Check Out</b> when you leave. If you go for lunch and come back, just tap <b>Check In</b> again — multiple entries per day are supported.</div>
-          </div>
-          <div class="guide-step">
-            <div class="guide-step-num teal">5</div>
-            <div class="guide-step-text">Scroll down to see your last 14 days of attendance. Tap <b>⬇ Export CSV</b> to download your full personal attendance record.</div>
-          </div>
+        <div class="g-role-card g-staff-card">
+          <div class="g-role-title">👤 Staff (Housekeeping / Security / etc.)</div>
+          <div class="g-step"><div class="g-step-num g-step-num-t">1</div><div class="g-step-text">Open this same link on your phone. Tap <b>Sign in with Google</b> using the <b>exact email</b> your admin registered you with. Do not create a new account.</div></div>
+          <div class="g-step"><div class="g-step-num g-step-num-t">2</div><div class="g-step-text">Your name, designation, and shift load automatically. The society name appears at the top.</div></div>
+          <div class="g-step"><div class="g-step-num g-step-num-t">3</div><div class="g-step-text">Tap <b>✅ Check In</b> when you arrive → a popup shows the exact time → tap <b>Confirm Entry</b> to save it.</div></div>
+          <div class="g-step"><div class="g-step-num g-step-num-t">4</div><div class="g-step-text">Tap <b>🏁 Check Out</b> when you leave. If you come back after lunch, tap Check In again — multiple entries per day are supported.</div></div>
+          <div class="g-step"><div class="g-step-num g-step-num-t">5</div><div class="g-step-text">Your full attendance history is below the buttons. Tap <b>⬇ Export CSV</b> to download it as proof.</div></div>
         </div>
       </div>
 
-      <!-- BUTTONS -->
-      <div class="guide-section">
-        <div class="guide-section-title">🔘 What Every Button Does</div>
-
-        <div class="guide-item">
-          <div class="guide-icon purple">🔑</div>
-          <div>
-            <div class="guide-item-title">Sign in with Google <span class="guide-badge both">Admin &amp; Staff</span></div>
-            <div class="guide-item-desc">Opens Google's secure login screen. Admins can use any Google account. Staff <b>must</b> use the exact email the admin registered them with — otherwise they'll see "Account not recognised."</div>
-          </div>
-        </div>
-
-        <div class="guide-item">
-          <div class="guide-icon purple">📝</div>
-          <div>
-            <div class="guide-item-title">Register Admin <span class="guide-badge admin">Admin only</span></div>
-            <div class="guide-item-desc">Creates a new society office account using email &amp; password. Each society registers separately — their data is completely private from other societies. Staff do NOT register here.</div>
-          </div>
-        </div>
-
-        <div class="guide-item">
-          <div class="guide-icon purple">➕</div>
-          <div>
-            <div class="guide-item-title">Add Staff Member <span class="guide-badge admin">Admin only</span></div>
-            <div class="guide-item-desc">Adds a new staff profile. The <b>email field here is what that person must use to log in</b> — make sure it matches their Google account email exactly. Once added, they can immediately sign in.</div>
-          </div>
-        </div>
-
-        <div class="guide-item">
-          <div class="guide-icon purple">✏️</div>
-          <div>
-            <div class="guide-item-title">Edit Staff (pencil icon) <span class="guide-badge admin">Admin only</span></div>
-            <div class="guide-item-desc">Changes a staff member's name, designation, or shift timings. Email cannot be edited (it's the login key) — to change email, delete and re-add the staff member.</div>
-          </div>
-        </div>
-
-        <div class="guide-item">
-          <div class="guide-icon pink">🗑️</div>
-          <div>
-            <div class="guide-item-title">Delete Staff (bin icon) <span class="guide-badge admin">Admin only</span></div>
-            <div class="guide-item-desc">Permanently removes that staff profile. Their past attendance records stay in the database but they can no longer log in to mark attendance.</div>
-          </div>
-        </div>
-
-        <div class="guide-item">
-          <div class="guide-icon purple">👤 card</div>
-          <div>
-            <div class="guide-item-title">Click a Staff Card <span class="guide-badge admin">Admin only</span></div>
-            <div class="guide-item-desc">Opens that staff member's full attendance history. Pick a "From" and "To" date → click <b>Search</b> (or just change the dates — it auto-searches). Use <b>⬇ Export</b> to download their records as a CSV spreadsheet.</div>
-          </div>
-        </div>
-
-        <div class="guide-item">
-          <div class="guide-icon teal">✅</div>
-          <div>
-            <div class="guide-item-title">Check In <span class="guide-badge staff">Staff only</span></div>
-            <div class="guide-item-desc">Marks your arrival time. Opens a confirmation popup showing the exact current time — tap <b>Confirm Entry</b> to save. This also automatically emails the admin. You can check in again after a lunch break.</div>
-          </div>
-        </div>
-
-        <div class="guide-item">
-          <div class="guide-icon pink">🏁</div>
-          <div>
-            <div class="guide-item-title">Check Out <span class="guide-badge staff">Staff only</span></div>
-            <div class="guide-item-desc">Marks your departure time. Only becomes active after you've checked in. Opens a confirmation popup — tap <b>Confirm Exit</b> to save. Admin is notified automatically.</div>
-          </div>
-        </div>
-
-        <div class="guide-item">
-          <div class="guide-icon amber">📊</div>
-          <div>
-            <div class="guide-item-title">Export CSV <span class="guide-badge both">Admin &amp; Staff</span></div>
-            <div class="guide-item-desc"><b>Admin — Today's records:</b> exports all staff's attendance for today in one spreadsheet.<br><b>Admin — Staff history:</b> exports one staff member's records for the selected date range.<br><b>Staff:</b> exports your complete personal attendance history — use this as proof of your attendance.</div>
-          </div>
-        </div>
-
-        <div class="guide-item">
-          <div class="guide-icon blue">🔍</div>
-          <div>
-            <div class="guide-item-title">Search (date filter) <span class="guide-badge admin">Admin only</span></div>
-            <div class="guide-item-desc">Filters a staff member's history to the chosen date range. Also triggers automatically when you change either date picker — no need to click Search manually.</div>
-          </div>
-        </div>
-
-        <div class="guide-item">
-          <div class="guide-icon green">🔒</div>
-          <div>
-            <div class="guide-item-title">Forgot Password <span class="guide-badge admin">Admin only</span></div>
-            <div class="guide-item-desc">Sends a password reset link to the admin's email. Works only for email/password accounts — Google Sign-In accounts are managed by Google directly.</div>
-          </div>
-        </div>
-
-        <div class="guide-item">
-          <div class="guide-icon pink">↩️</div>
-          <div>
-            <div class="guide-item-title">Sign Out <span class="guide-badge both">Admin &amp; Staff</span></div>
-            <div class="guide-item-desc">Securely logs out the current user. The next person to open the app will see the login screen fresh — important on shared devices.</div>
-          </div>
-        </div>
+      <div class="g-section">
+        <div class="g-section-title">🔘 What Every Button Does</div>
+        <div class="g-item"><div class="g-icon gi-purple">🔑</div><div><div class="g-item-title">Sign in with Google<span class="g-badge gb-both">Both</span></div><div class="g-item-desc">Opens Google's secure login. Admins use any Google account. Staff <b>must</b> use the email the admin registered them with — any other email shows "Account not recognised."</div></div></div>
+        <div class="g-item"><div class="g-icon gi-purple">📝</div><div><div class="g-item-title">Register Admin<span class="g-badge gb-admin">Admin only</span></div><div class="g-item-desc">Creates a new society office account with email + password. Each society registers separately — data is 100% private. <b>Staff do not register here.</b></div></div></div>
+        <div class="g-item"><div class="g-icon gi-purple">➕</div><div><div class="g-item-title">Add Staff Member<span class="g-badge gb-admin">Admin only</span></div><div class="g-item-desc">Adds a staff profile. The email you enter here is the login key for that staff member — it <b>must exactly match</b> their Google account email. Once added, they can sign in immediately.</div></div></div>
+        <div class="g-item"><div class="g-icon gi-teal">✏️</div><div><div class="g-item-title">Edit Staff (pencil icon)<span class="g-badge gb-admin">Admin only</span></div><div class="g-item-desc">Change a staff member's name, designation, or shift. Email cannot be edited (it's the login identity) — to change email, delete and re-add the staff member.</div></div></div>
+        <div class="g-item"><div class="g-icon gi-pink">🗑️</div><div><div class="g-item-title">Delete Staff (bin icon)<span class="g-badge gb-admin">Admin only</span></div><div class="g-item-desc">Removes the staff profile permanently. The person can no longer log in. Past attendance records remain in the database.</div></div></div>
+        <div class="g-item"><div class="g-icon gi-purple">👤</div><div><div class="g-item-title">Click a Staff Card<span class="g-badge gb-admin">Admin only</span></div><div class="g-item-desc">Opens that person's full attendance history. Select From and To dates → click <b>Search</b> (or just change the dates — it auto-searches). <b>Export</b> downloads a CSV with every entry-pair as a separate row.</div></div></div>
+        <div class="g-item"><div class="g-icon gi-teal">✅</div><div><div class="g-item-title">Check In<span class="g-badge gb-staff">Staff only</span></div><div class="g-item-desc">Marks arrival. Opens a confirmation popup showing the exact time — tap <b>Confirm Entry</b>. Saves to the database and auto-emails the admin. Available again after each check-out (for multiple entries per day).</div></div></div>
+        <div class="g-item"><div class="g-icon gi-pink">🏁</div><div><div class="g-item-title">Check Out<span class="g-badge gb-staff">Staff only</span></div><div class="g-item-desc">Marks departure. Only active after checking in. Tap <b>Confirm Exit</b>. Admin is notified automatically. After checkout, Check In becomes available again.</div></div></div>
+        <div class="g-item"><div class="g-icon gi-amber">⬇️</div><div><div class="g-item-title">Export CSV<span class="g-badge gb-both">Both</span></div><div class="g-item-desc"><b>Admin (Attendance tab):</b> exports all staff for today. <b>Admin (staff card popup):</b> exports one staff member's selected date range. <b>Staff:</b> exports your complete personal history — use as proof of attendance.</div></div></div>
+        <div class="g-item"><div class="g-icon gi-green">🔒</div><div><div class="g-item-title">Forgot Password<span class="g-badge gb-admin">Admin only</span></div><div class="g-item-desc">Sends a reset link to the admin's email. Works only for email/password accounts. Google Sign-In passwords are managed by Google.</div></div></div>
+        <div class="g-item"><div class="g-icon gi-pink">↩️</div><div><div class="g-item-title">Sign Out<span class="g-badge gb-both">Both</span></div><div class="g-item-desc">Securely logs out. Important on shared devices — the next person will see the login screen fresh.</div></div></div>
       </div>
 
-      <!-- EMAILS -->
-      <div class="guide-section">
-        <div class="guide-section-title">📧 How Emails Work</div>
-
-        <div class="guide-email-box">
-          <div class="guide-email-type">✅ Check-In Notification</div>
-          <div class="guide-email-desc">
-            Sent automatically to the <b>admin's registered email</b> the moment a staff member confirms their check-in. Contains the staff member's name, email, check-in time, and date.
-            The admin does not need to do anything — the email just arrives in their inbox.
-          </div>
-        </div>
-
-        <div class="guide-email-box">
-          <div class="guide-email-type">🏁 Check-Out Notification</div>
-          <div class="guide-email-desc">
-            Same as above but for check-out. Also sent automatically to the admin on confirmation. If a staff member checks in and out multiple times (e.g. lunch break), an email is sent for each event.
-          </div>
-        </div>
-
-        <div class="guide-email-box">
-          <div class="guide-email-type">🔒 Password Reset Email</div>
-          <div class="guide-email-desc">
-            Sent by Firebase (Google) directly to the admin's registered email when "Forgot password?" is clicked. Contains a secure link to set a new password. Valid for 1 hour.
-          </div>
-        </div>
-
-        <div class="guide-email-box">
-          <div class="guide-email-type" style="color:var(--accent2);">⚠️ If Staff Show "Account Not Recognised"</div>
-          <div class="guide-email-desc">
-            This means the email they signed in with (their Google account email) does not match what the admin typed when adding them. Ask the admin to check the email in <b>Manage Staff</b> and correct it — or the staff member should try a different Google account that matches the registered email.
-          </div>
-        </div>
+      <div class="g-section">
+        <div class="g-section-title">📧 How Emails Work</div>
+        <div class="g-email-box"><div class="g-email-type">✅ Check-In / 🏁 Check-Out Notifications</div><div class="g-email-desc">Sent automatically to the <b>admin's registered email</b> every time a staff member confirms an entry or exit. No manual step needed. Contains staff name, action (Checked IN / OUT), exact time, and date.</div></div>
+        <div class="g-email-box"><div class="g-email-type">🔒 Password Reset</div><div class="g-email-desc">Sent by Firebase (Google) when "Forgot password?" is clicked. Valid for 1 hour. Only works for email/password accounts.</div></div>
+        <div class="g-email-box" style="border-color:var(--accent2)"><div class="g-email-type" style="color:var(--accent2)">⚠️ "Account not recognised" — What it means</div><div class="g-email-desc">The email the staff member signed in with does not match what the admin registered. Fix: admin goes to <b>Manage Staff</b>, checks the email on that staff card, and corrects it. Or the staff member should sign in with a Google account that matches the registered email.</div></div>
       </div>
 
-      <!-- MULTIPLE CHECK-INS -->
-      <div class="guide-section">
-        <div class="guide-section-title">🔄 Multiple Check-Ins Per Day</div>
-        <div class="guide-item">
-          <div class="guide-icon teal">🍽️</div>
-          <div>
-            <div class="guide-item-title">Lunch Breaks &amp; Return Visits</div>
-            <div class="guide-item-desc">
-              Staff can check in and out as many times as needed in one day. Example: arrive at 9 AM → check in. Leave for lunch at 1 PM → check out. Return at 2 PM → check in again. Leave at 6 PM → check out again.<br><br>
-              The app stores all entry pairs (9–1, 2–6). <b>Total hours</b> adds them together (8h 00m). The admin's attendance table shows all pairs for the day. Each pair appears on its own row in the CSV export with an Entry# column.
-            </div>
-          </div>
-        </div>
+      <div class="g-section">
+        <div class="g-section-title">🔄 Multiple Check-Ins Per Day</div>
+        <div class="g-item"><div class="g-icon gi-teal">🍽️</div><div><div class="g-item-title">Lunch Breaks &amp; Return Visits</div><div class="g-item-desc">Staff can check in and out any number of times in one day. Example: arrive 9 AM → check in. Leave for lunch 1 PM → check out. Return 2 PM → check in again. Leave 6 PM → check out.<br><br>All pairs (9–1 PM and 2–6 PM) are stored. Total hours = 8h 00m. The attendance table and CSV show each pair numbered (1. 9:00 AM → 1:00 PM | 2. 2:00 PM → 6:00 PM).</div></div></div>
       </div>
 
-      <!-- PRIVACY & DATA -->
-      <div class="guide-section">
-        <div class="guide-section-title">🔐 Privacy &amp; Data</div>
-        <div class="guide-item">
-          <div class="guide-icon purple">🏢</div>
-          <div>
-            <div class="guide-item-title">Each Society's Data is Isolated</div>
-            <div class="guide-item-desc">When you register as a new admin (e.g. "Ratna Apt" and "Mansi Residency"), each society's staff and attendance are completely separate. One society can never see another's records.</div>
-          </div>
-        </div>
-        <div class="guide-item">
-          <div class="guide-icon green">☁️</div>
-          <div>
-            <div class="guide-item-title">Data is Stored in Firebase (Google Cloud)</div>
-            <div class="guide-item-desc">All attendance records, staff profiles, and admin accounts are stored securely in Google Firestore. Data persists permanently — closing or refreshing the browser does not lose any records. Historical records are available forever.</div>
-          </div>
-        </div>
+      <div class="g-section">
+        <div class="g-section-title">🔐 Privacy &amp; Data</div>
+        <div class="g-item"><div class="g-icon gi-purple">🏢</div><div><div class="g-item-title">Each Society's Data is Completely Isolated</div><div class="g-item-desc">Ratna Apt and Mansi Residency (for example) each have their own admin account. Their staff lists and attendance records are entirely separate — no society can ever see another's data.</div></div></div>
+        <div class="g-item"><div class="g-icon gi-green">☁️</div><div><div class="g-item-title">Stored Permanently in Google Firebase</div><div class="g-item-desc">All data lives in Google Firestore (cloud database). Closing the browser, refreshing, or switching devices never loses records. History goes back as far as the first check-in ever recorded.</div></div></div>
       </div>
 
-    </div><!-- end guide-body -->
+    </div>
   </div>
 </div>
 
