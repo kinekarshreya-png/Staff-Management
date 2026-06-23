@@ -17,7 +17,7 @@
     } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-auth.js";
     import {
       getFirestore, collection, doc, setDoc, getDoc, getDocs, updateDoc,
-      onSnapshot, serverTimestamp, query, where, orderBy
+      onSnapshot, serverTimestamp, query, where, orderBy, arrayUnion
     } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js";
 
     const firebaseConfig = {
@@ -369,7 +369,7 @@
       if (from > to) { showToast("'From' date must be before 'To' date","warn"); return; }
 
       const tbody = $("history-tbody");
-      tbody.innerHTML = `<tr><td colspan="5" class="empty-state">Loading…</td></tr>`;
+      tbody.innerHTML = `<tr><td colspan="4" class="empty-state">Loading…</td></tr>`;
 
       try {
         // Filter only by staffId server-side (single-field, no index needed),
@@ -386,69 +386,394 @@
         renderStaffHistoryTable(rows);
       } catch (e) {
         console.error(e);
-        tbody.innerHTML = `<tr><td colspan="5" class="empty-state">Couldn't load history: ${e.message}</td></tr>`;
+        tbody.innerHTML = `<tr><td colspan="4" class="empty-state">Couldn't load history: ${e.message}</td></tr>`;
         showToast("Failed to load history","error");
       }
     };
 
-    function renderStaffHistoryTable(rows) {
-      const tbody = $("history-tbody");
-      if (!rows.length) {
-        tbody.innerHTML = `<tr><td colspan="5" class="empty-state">No attendance records in this range</td></tr>`;
-        return;
-      }
-      tbody.innerHTML = rows.map(r => {
-        const inTime  = r.checkIn  ? fmt12(r.checkIn)  : "—";
-        const outTime = r.checkOut ? fmt12(r.checkOut) : "—";
-        const dur = r.checkIn && r.checkOut ? getDuration(r.checkIn, r.checkOut) : "—";
-        const status = !r.checkIn ? "Absent" : !r.checkOut ? "Checked In" : "Completed";
+    // ── Multi-entry helpers ───────────────────────────────────────
+    // Each attendance doc now stores entries: [{in: iso, out: iso|null}, ...]
+    // A new Check In adds a new entry; Check Out fills out on the last entry.
+    const getEntries    = log => (log && log.entries && log.entries.length) ? log.entries : [];
+    const lastEntry     = log => { const e = getEntries(log); return e.length ? e[e.length-1] : null; };
+    const canCheckIn    = log => { const l = lastEntry(log); return !l || l.out !== null; };
+    const canCheckOut   = log => { const l = lastEntry(log); return l && l.out === null; };
+    const firstIn       = log => { const e = getEntries(log); return e.length ? e[0].in : null; };
+    const totalMins     = log => getEntries(log).reduce((sum,e) => {
+      if (!e.in || !e.out) return sum;
+      return sum + Math.max(0, Math.round((new Date(e.out) - new Date(e.in)) / 60000));
+    }, 0);
+    const fmtTotalHours = log => {
+      const m = totalMins(log);
+      if (!m) return "—";
+      return `${Math.floor(m/60)}h ${pad(m%60)}m`;
+    };
+    const entryLines = log => getEntries(log)
+      .map((e,i) => `${i+1}. ${e.in ? fmt12(e.in) : "—"} → ${e.out ? fmt12(e.out) : "in progress"}`)
+      .join(" | ");
+
+    function isLate(log, shiftStart) {
+      const fin = firstIn(log);
+      if (!fin || !shiftStart) return false;
+      const d=new Date(fin), [sh,sm]=shiftStart.split(":").map(Number);
+      return (d.getHours()*60+d.getMinutes()) > (sh*60+sm);
+    }
+
+    function getDuration(inIso, outIso) {
+      const mins = Math.round((new Date(outIso)-new Date(inIso))/60000);
+      return `${Math.floor(mins/60)}h ${pad(mins%60)}m`;
+    }
+
+    // ── Render admin attendance table (multi-entry aware) ─────────
+    function renderAttendanceTable(staff, logMap, date) {
+      const tbody = $("attendance-tbody");
+      if (!staff.length) { tbody.innerHTML=`<tr><td colspan="7" class="empty-state">No staff yet</td></tr>`; return; }
+      tbody.innerHTML = staff.map(s => {
+        const log = logMap[s.id] || {};
+        const entries = getEntries(log);
+        const fin  = firstIn(log);
+        const late = isLate(log, s.shiftStart);
+        const hrs  = fmtTotalHours(log);
+        const hasAnyIn = entries.length > 0;
+        const allDone  = hasAnyIn && entries.every(e => e.out);
+        const status   = !hasAnyIn ? "Absent" : allDone ? "Completed" : "Checked In";
+        // Show entries compactly
+        const entryHtml = entries.length
+          ? entries.map((e,i)=>
+              `<div style="font-size:11.5px;font-family:var(--mono);color:var(--muted);">
+                ${i+1}. ${fmt12(e.in)} → ${e.out?fmt12(e.out):'<b style="color:var(--teal)">now</b>'}
+              </div>`).join("")
+          : `<span style="color:var(--muted)">—</span>`;
         return `<tr>
-          <td class="mono">${r.date}</td>
-          <td class="mono">${inTime}</td>
-          <td class="mono">${outTime}</td>
-          <td class="mono">${dur}</td>
+          <td><b>${s.name}</b>${late?`<span class="late-badge">Late</span>`:""}
+          </td>
+          <td style="font-size:12.5px;">${s.designation}</td>
+          <td class="mono" style="font-size:12px;">${s.shiftStart}</td>
+          <td style="min-width:160px;">${entryHtml}</td>
+          <td class="mono">${hrs}</td>
           <td><span class="status-badge status-${status.toLowerCase().replace(" ","-")}">${status}</span></td>
         </tr>`;
       }).join("");
     }
 
+    function renderSummaryCards(staff, logMap) {
+      const present = staff.filter(s => getEntries(logMap[s.id]||{}).length > 0).length;
+      const late    = staff.filter(s => {
+        const log = logMap[s.id]||{};
+        return getEntries(log).length > 0 && isLate(log, s.shiftStart);
+      }).length;
+      const absent  = staff.length - present;
+      $("card-total").textContent   = staff.length;
+      $("card-present").textContent = present;
+      $("card-late").textContent    = late;
+      $("card-absent").textContent  = absent;
+    }
+
+    // ── Admin today CSV export (multi-entry aware) ─────────────────
+    window.exportCSV = async () => {
+      const sQ = query(collection(db,"staff"), where("adminUid","==",currentUser.uid));
+      const sSnap = await getDocs(sQ);
+      const staff = sSnap.docs.map(d=>({id:d.id,...d.data()}));
+      const key   = dayKey();
+      const lQ    = query(collection(db,"attendance"),where("adminUid","==",currentUser.uid),where("date","==",key));
+      const lSnap = await getDocs(lQ);
+      const logMap={};
+      lSnap.docs.forEach(d=>{ logMap[d.data().staffId]=d.data(); });
+      const rows = [["Date","Name","Designation","Shift","Entries","Total Hours","Status","Late"]];
+      staff.forEach(s=>{
+        const log = logMap[s.id] || {};
+        const entries = getEntries(log);
+        const status  = !entries.length ? "Absent" : entries.every(e=>e.out) ? "Completed" : "Checked In";
+        rows.push([key, s.name, s.designation||"", s.shiftStart,
+          entryLines(log), fmtTotalHours(log), status,
+          entries.length && isLate(log, s.shiftStart) ? "Yes" : "No"]);
+      });
+      const csv=rows.map(r=>r.map(v=>`"${v}"`).join(",")).join("\n");
+      const a=document.createElement("a");
+      a.href="data:text/csv;charset=utf-8,"+encodeURIComponent(csv);
+      a.download=`attendance_${key}.csv`; a.click();
+      showToast("CSV exported","success");
+    };
+
+    // ── Staff history table (admin clicks staff card) ──────────────
+    function renderStaffHistoryTable(rows) {
+      const tbody = $("history-tbody");
+      if (!rows.length) {
+        tbody.innerHTML = `<tr><td colspan="4" class="empty-state">No attendance records in this range</td></tr>`;
+        return;
+      }
+      tbody.innerHTML = rows.map(r => {
+        const entries = getEntries(r);
+        const hrs  = fmtTotalHours(r);
+        const status = !entries.length ? "Absent" : entries.every(e=>e.out) ? "Completed" : "Checked In";
+        const entryHtml = entries.length
+          ? entries.map((e,i)=>
+              `<div style="font-size:11.5px;font-family:var(--mono);">
+                ${i+1}. ${fmt12(e.in)} → ${e.out?fmt12(e.out):'in progress'}
+              </div>`).join("")
+          : "—";
+        return `<tr>
+          <td class="mono">${r.date}</td>
+          <td>${entryHtml}</td>
+          <td class="mono">${hrs}</td>
+          <td><span class="status-badge status-${status.toLowerCase().replace(" ","-")}">${status}</span></td>
+        </tr>`;
+      }).join("");
+    }
+
+    // ── Admin per-staff CSV export (multi-entry aware) ─────────────
     window.exportStaffHistoryCSV = async () => {
       const from = $("history-from").value;
       const to   = $("history-to").value;
       if (!from || !to) { showToast("Pick both From and To dates","warn"); return; }
-      if (from > to) { showToast("'From' date must be before 'To' date","warn"); return; }
-
+      if (from > to)    { showToast("'From' must be before 'To'","warn"); return; }
       try {
-        const hq = query(
-          collection(db,"attendance"),
-          where("staffId","==",historyStaffId)
-        );
+        const hq = query(collection(db,"attendance"), where("staffId","==",historyStaffId));
         const snap = await getDocs(hq);
-        const rows = [["Date","Name","Check In","Check Out","Hours","Status"]];
-        snap.docs
+        const filteredDocs = snap.docs
           .map(d => d.data())
           .filter(r => r.adminUid === currentUser.uid && r.date >= from && r.date <= to)
-          .sort((a,b) => b.date.localeCompare(a.date))
-          .forEach(r => {
-            const dur = r.checkIn && r.checkOut ? getDuration(r.checkIn, r.checkOut) : "";
-            const status = !r.checkIn ? "Absent" : !r.checkOut ? "Checked In" : "Completed";
-            rows.push([r.date, historyStaffName,
-              r.checkIn?fmt12(r.checkIn):"", r.checkOut?fmt12(r.checkOut):"", dur, status]);
-          });
-        if (rows.length === 1) { showToast("No records to export in this range","warn"); return; }
+          .sort((a,b) => b.date.localeCompare(a.date));
+        if (!filteredDocs.length) { showToast("No records to export in this range","warn"); return; }
+        // One row per entry-pair within each day
+        const rows = [["Date","Name","Entry#","Check In","Check Out","Hours","Status"]];
+        filteredDocs.forEach(r => {
+          const entries = getEntries(r);
+          if (!entries.length) {
+            rows.push([r.date, historyStaffName, "—","—","—","—","Absent"]);
+          } else {
+            entries.forEach((e,i) => {
+              const dur = e.in && e.out ? getDuration(e.in, e.out) : "";
+              const status = !e.out ? "Checked In" : "Completed";
+              rows.push([r.date, historyStaffName, i+1,
+                e.in?fmt12(e.in):"", e.out?fmt12(e.out):"", dur, status]);
+            });
+          }
+        });
         const csv = rows.map(r=>r.map(v=>`"${v}"`).join(",")).join("\n");
         const a = document.createElement("a");
         a.href = "data:text/csv;charset=utf-8,"+encodeURIComponent(csv);
         a.download = `${historyStaffName.replace(/\s+/g,"_")}_${from}_to_${to}.csv`;
         a.click();
         showToast("CSV exported","success");
-      } catch (e) {
+      } catch(e) {
         console.error(e);
         showToast("Export failed: "+e.message,"error");
       }
     };
 
-    // ── Today attendance (admin) ──────────────────────────────────
+    // ── Staff own history render (multi-entry aware) ───────────────
+    function renderMyHistory(rows) {
+      const listEl = $("my-history-list");
+      if (!rows.length) {
+        listEl.innerHTML = `<div class="empty-state">No attendance records yet</div>`;
+        return;
+      }
+      listEl.innerHTML = rows.map(r => {
+        const entries = getEntries(r);
+        const hrs  = fmtTotalHours(r);
+        const status = !entries.length ? "Absent" : entries.every(e=>e.out) ? "Completed" : "Checked In";
+        const entryHtml = entries.length
+          ? entries.map((e,i) =>
+              `<div class="mono" style="font-size:11.5px;">${i+1}. ${fmt12(e.in)} → ${e.out?fmt12(e.out):'<b style="color:var(--teal)">now</b>'}</div>`
+            ).join("")
+          : `<span class="mono" style="font-size:12px;">—</span>`;
+        return `<div class="history-row">
+          <div style="flex:1;min-width:0;">
+            <div class="history-row-date">${r.date}</div>
+            <div style="margin-top:4px;">${entryHtml}</div>
+          </div>
+          <div style="text-align:right;">
+            <div class="history-row-hours mono" style="font-size:13px;font-weight:700;margin-bottom:5px;">${hrs}</div>
+            <span class="status-badge status-${status.toLowerCase().replace(" ","-")}">${status}</span>
+          </div>
+        </div>`;
+      }).join("");
+    }
+
+    // ── Staff my-history CSV export ─────────────────────────────────
+    window.exportMyHistoryCSV = async () => {
+      const listEl = $("my-history-list");
+      listEl && listEl.querySelectorAll('.empty-state');
+      try {
+        const hq = query(collection(db,"attendance"), where("staffId","==",staffProfile.id));
+        const snap = await getDocs(hq);
+        const sorted = snap.docs
+          .map(d => d.data())
+          .sort((a,b) => b.date.localeCompare(a.date));
+        if (!sorted.length) { showToast("No records to export","warn"); return; }
+        const rows = [["Date","Entry#","Check In","Check Out","Hours","Status","Society"]];
+        // Get society name for the export
+        const adminSnap = staffProfile.adminUid
+          ? await getDoc(doc(db,"admins",staffProfile.adminUid)) : null;
+        const society = adminSnap?.exists() ? adminSnap.data().society : "";
+        sorted.forEach(r => {
+          const entries = getEntries(r);
+          if (!entries.length) {
+            rows.push([r.date,"—","—","—","—","Absent",society]);
+          } else {
+            entries.forEach((e,i) => {
+              const dur = e.in && e.out ? getDuration(e.in, e.out) : "";
+              rows.push([r.date, i+1, e.in?fmt12(e.in):"", e.out?fmt12(e.out):"",
+                dur, !e.out?"Checked In":"Completed", society]);
+            });
+          }
+        });
+        const csv = rows.map(r=>r.map(v=>`"${v}"`).join(",")).join("\n");
+        const a = document.createElement("a");
+        a.href = "data:text/csv;charset=utf-8,"+encodeURIComponent(csv);
+        a.download = `my_attendance_${staffProfile.name.replace(/\s+/g,"_")}.csv`;
+        a.click();
+        showToast("Your attendance exported","success");
+      } catch(e) {
+        console.error(e);
+        showToast("Export failed: "+e.message,"error");
+      }
+    };
+
+    // ── listenStaffLog (multi-entry aware) ────────────────────────
+    function listenStaffLog() {
+      const key = dayKey();
+      const logRef = doc(db,"attendance",`${staffProfile.id}_${key}`);
+      onSnapshot(logRef, snap => {
+        const data = snap.exists() ? snap.data() : {};
+        updateStaffUI(data);
+      });
+    }
+
+    // ── updateStaffUI (multi-entry aware) ─────────────────────────
+    function updateStaffUI(log) {
+      const inBtn  = $("btn-checkin");
+      const outBtn = $("btn-checkout");
+      const entries = getEntries(log);
+      const last = lastEntry(log);
+
+      // Today's entry summary
+      const inEl  = $("display-in");
+      const outEl = $("display-out");
+      if (entries.length) {
+        inEl.textContent  = fmt12(entries[0].in);
+        outEl.textContent = last.out ? fmt12(last.out) : "In progress";
+        // Show all pairs if multiple
+        const todayEl = $("today-entries");
+        if (todayEl) {
+          todayEl.innerHTML = entries.map((e,i)=>
+            `<div class="mono" style="font-size:12px;color:var(--muted);">
+              ${i+1}. ${fmt12(e.in)} → ${e.out?fmt12(e.out):'<b style="color:var(--teal)">now</b>'}
+            </div>`).join("");
+          todayEl.style.display = "block";
+        }
+      } else {
+        inEl.textContent  = "—";
+        outEl.textContent = "—";
+        const todayEl = $("today-entries");
+        if (todayEl) todayEl.style.display = "none";
+      }
+
+      inBtn.disabled  = !canCheckIn(log);
+      outBtn.disabled = !canCheckOut(log);
+    }
+
+    // ── Confirm modal for check-in / check-out ────────────────────
+    let pendingAction = null;
+
+    window.askConfirmCheckIn  = () => openConfirmModal("in");
+    window.askConfirmCheckOut = () => openConfirmModal("out");
+
+    function openConfirmModal(action) {
+      pendingAction = action;
+      const now = new Date();
+      $("confirm-action-title").textContent = action === "in" ? "Confirm Entry" : "Confirm Exit";
+      $("confirm-action-desc").textContent  = action === "in"
+        ? "You're about to mark your check-in time as:"
+        : "You're about to mark your check-out time as:";
+      $("confirm-action-time").textContent = now.toLocaleTimeString("en-IN",{hour:"2-digit",minute:"2-digit",second:"2-digit"});
+      $("confirm-action-btn").textContent = action === "in" ? "✅ Confirm Entry" : "🏁 Confirm Exit";
+      $("confirm-action-btn").className = "btn " + (action === "in" ? "btn-primary" : "btn-danger");
+      $("confirm-action-modal").classList.remove("hidden");
+    }
+
+    window.closeConfirmModal = () => {
+      $("confirm-action-modal").classList.add("hidden");
+      pendingAction = null;
+    };
+
+    window.confirmAction = async () => {
+      if (!pendingAction) return;
+      const action = pendingAction;
+      const btn = $("confirm-action-btn");
+      btn.disabled = true;
+      btn.textContent = "Saving…";
+      try {
+        if (action === "in") await doCheckIn();
+        else await doCheckOut();
+        await notifyAdmin(action);
+      } finally {
+        btn.disabled = false;
+        closeConfirmModal();
+        loadMyHistory();
+      }
+    };
+
+    // ── doCheckIn: appends a new {in, out:null} entry ─────────────
+    async function doCheckIn() {
+      const key   = dayKey();
+      const now   = new Date().toISOString();
+      const logId = `${staffProfile.id}_${key}`;
+      const newEntry = { in: now, out: null };
+      // setDoc with merge creates the doc if missing; arrayUnion appends the new entry
+      await setDoc(doc(db,"attendance",logId), {
+        staffId:    staffProfile.id,
+        staffName:  staffProfile.name,
+        staffEmail: staffProfile.email,
+        date:       key,
+        adminUid:   staffProfile.adminUid,
+        entries:    arrayUnion(newEntry),
+      }, { merge: true });
+      showToast("✅ Checked in at "+fmt12(now),"success");
+    }
+
+    // ── doCheckOut: fills out on the last open entry ──────────────
+    async function doCheckOut() {
+      const key   = dayKey();
+      const now   = new Date().toISOString();
+      const logId = `${staffProfile.id}_${key}`;
+      // Read the doc, find the last open entry, replace it with out filled
+      const snap = await getDoc(doc(db,"attendance",logId));
+      if (!snap.exists()) { showToast("No check-in found for today","warn"); return; }
+      const data    = snap.data();
+      const entries = [...(data.entries || [])];
+      const idx     = entries.map(e => e.out).lastIndexOf(null);
+      if (idx === -1) { showToast("No open check-in to close","warn"); return; }
+      entries[idx] = { ...entries[idx], out: now };
+      await updateDoc(doc(db,"attendance",logId), { entries });
+      showToast("🏁 Checked out at "+fmt12(now),"info");
+    }
+
+    async function getAdminEmail() {
+      if (!staffProfile.adminUid) return null;
+      const snap = await getDoc(doc(db,"admins",staffProfile.adminUid));
+      return snap.exists() ? snap.data().email : null;
+    }
+
+    async function notifyAdmin(action) {
+      const key  = dayKey();
+      const snap = await getDoc(doc(db,"attendance",`${staffProfile.id}_${key}`));
+      if (!snap.exists()) return;
+      const data    = snap.data();
+      const entries = data.entries || [];
+      const time    = action === "in"
+        ? fmt12(entries[entries.length-1]?.in)
+        : fmt12(entries[entries.length-1]?.out);
+      const adminEmail = await getAdminEmail();
+      if (!adminEmail) { showToast("Admin email not found","warn"); return; }
+      const adminSnap   = await getDoc(doc(db,"admins",staffProfile.adminUid));
+      const societyName = adminSnap?.exists() ? adminSnap.data().society : "Society";
+      await sendEmailNotification({
+        staffName: staffProfile.name, staffEmail: staffProfile.email,
+        action, time, adminEmail, societyName
+      });
+    }
     async function loadTodayAttendance(staffList) {
       const key = dayKey();
       const logsRef = collection(db,"attendance");
@@ -625,71 +950,9 @@
       }
     }
 
-    // ── Confirm modal for check-in / check-out ──────────────────────
-    let pendingAction = null; // "in" | "out"
-
-    window.askConfirmCheckIn  = () => openConfirmModal("in");
-    window.askConfirmCheckOut = () => openConfirmModal("out");
-
-    function openConfirmModal(action) {
-      pendingAction = action;
-      const now = new Date();
-      $("confirm-action-title").textContent = action === "in" ? "Confirm Entry" : "Confirm Exit";
-      $("confirm-action-desc").textContent  = action === "in"
-        ? "You're about to mark your check-in time as:"
-        : "You're about to mark your check-out time as:";
-      $("confirm-action-time").textContent = now.toLocaleTimeString("en-IN",{hour:"2-digit",minute:"2-digit",second:"2-digit"});
-      $("confirm-action-btn").textContent = action === "in" ? "✅ Confirm Entry" : "🏁 Confirm Exit";
-      $("confirm-action-btn").className = "btn " + (action === "in" ? "btn-primary" : "btn-danger");
-      $("confirm-action-modal").classList.remove("hidden");
-    }
-
-    window.closeConfirmModal = () => {
-      $("confirm-action-modal").classList.add("hidden");
-      pendingAction = null;
-    };
-
-    window.confirmAction = async () => {
-      if (!pendingAction) return;
-      const action = pendingAction;
-      const btn = $("confirm-action-btn");
-      btn.disabled = true;
-      btn.textContent = "Saving…";
-      try {
-        if (action === "in") await doCheckIn();
-        else await doCheckOut();
-        // Auto-notify admin immediately — no separate button needed
-        await notifyAdmin(action);
-      } finally {
-        btn.disabled = false;
-        closeConfirmModal();
-        loadMyHistory();
-      }
-    };
-
-    async function doCheckIn() {
-      const key   = dayKey();
-      const now   = new Date().toISOString();
-      const logId = `${staffProfile.id}_${key}`;
-      await setDoc(doc(db,"attendance",logId),{
-        staffId:   staffProfile.id,
-        staffName: staffProfile.name,
-        staffEmail:staffProfile.email,
-        date: key,
-        checkIn: now,
-        checkOut: null,
-        adminUid: staffProfile.adminUid,
-      },{merge:true});
-      showToast("✅ Checked in at "+fmt12(now),"success");
-    }
-
-    async function doCheckOut() {
-      const key   = dayKey();
-      const now   = new Date().toISOString();
-      const logId = `${staffProfile.id}_${key}`;
-      await updateDoc(doc(db,"attendance",logId),{ checkOut: now });
-      showToast("🏁 Checked out at "+fmt12(now),"info");
-    }
+    // ── App guide modal ───────────────────────────────────────────
+    window.openGuide  = () => $("guide-modal").classList.remove("hidden");
+    window.closeGuide = () => $("guide-modal").classList.add("hidden");
 
     async function getAdminEmail() {
       if (!staffProfile.adminUid) return null;
@@ -827,6 +1090,84 @@
     .avatar-sm { width:32px; height:32px; border-radius:50%; background:var(--accent); display:flex; align-items:center; justify-content:center; font-weight:700; font-size:13px; color:#FFFFFF; }
     .signout-btn { background:transparent; border:1px solid var(--border); border-radius:8px; padding:7px 12px; color:var(--muted); font-size:13px; cursor:pointer; transition:.2s; }
     .signout-btn:hover { border-color:var(--accent2); color:var(--accent2); }
+    .help-btn {
+      background:linear-gradient(90deg,#7C3AED,#6D28D9); color:#fff;
+      border:none; border-radius:8px; padding:7px 13px; font-size:13px;
+      font-weight:700; cursor:pointer; transition:.2s;
+      box-shadow:0 4px 12px rgba(109,40,217,.25);
+    }
+    .help-btn:hover { filter:brightness(1.1); }
+
+    /* ── Guide modal ───────────────────────────────── */
+    #guide-modal .modal-box {
+      max-width:660px; max-height:85vh; overflow-y:auto; padding:0;
+    }
+    .guide-header {
+      background:linear-gradient(120deg,#7C3AED,#E94F8A);
+      padding:28px 28px 22px; border-radius:var(--radius) var(--radius) 0 0;
+      color:#fff; position:sticky; top:0; z-index:1;
+    }
+    .guide-header h2 { font-size:20px; font-weight:800; margin-bottom:4px; }
+    .guide-header p  { font-size:13px; opacity:.85; }
+    .guide-close {
+      position:absolute; top:18px; right:20px;
+      background:rgba(255,255,255,.2); border:none; color:#fff;
+      border-radius:50%; width:30px; height:30px; font-size:16px;
+      cursor:pointer; display:flex; align-items:center; justify-content:center;
+    }
+    .guide-body { padding:24px 28px 28px; }
+    .guide-section { margin-bottom:28px; }
+    .guide-section:last-child { margin-bottom:0; }
+    .guide-section-title {
+      font-size:13px; font-weight:800; text-transform:uppercase;
+      letter-spacing:.06em; color:var(--accent); margin-bottom:12px;
+      padding-bottom:6px; border-bottom:2px solid var(--border);
+    }
+    .guide-item {
+      display:flex; gap:12px; margin-bottom:12px; align-items:flex-start;
+    }
+    .guide-icon {
+      width:34px; height:34px; border-radius:9px; flex-shrink:0;
+      display:flex; align-items:center; justify-content:center; font-size:16px;
+    }
+    .guide-icon.purple { background:#EDE9FE; }
+    .guide-icon.teal   { background:#CCFBF1; }
+    .guide-icon.pink   { background:#FCE7F3; }
+    .guide-icon.amber  { background:#FEF3C7; }
+    .guide-icon.green  { background:#DCFCE7; }
+    .guide-icon.blue   { background:#DBEAFE; }
+    .guide-item-title  { font-weight:700; font-size:14px; margin-bottom:3px; }
+    .guide-item-desc   { font-size:13px; color:var(--muted); line-height:1.55; }
+    .guide-badge {
+      display:inline-block; font-size:11px; font-weight:700; padding:2px 8px;
+      border-radius:5px; margin-right:4px; margin-bottom:3px;
+    }
+    .guide-badge.admin  { background:#EDE9FE; color:#6D28D9; }
+    .guide-badge.staff  { background:#CCFBF1; color:#0D9488; }
+    .guide-badge.both   { background:#FEF3C7; color:#B45309; }
+    .guide-role-card {
+      border-radius:12px; padding:16px; margin-bottom:12px;
+      border:1px solid var(--border);
+    }
+    .guide-role-card.admin-card { background:#F5F3FF; border-color:#DDD6FE; }
+    .guide-role-card.staff-card { background:#F0FDFA; border-color:#99F6E4; }
+    .guide-role-title { font-weight:800; font-size:14px; margin-bottom:8px; }
+    .guide-step {
+      display:flex; gap:10px; align-items:flex-start; margin-bottom:10px;
+    }
+    .guide-step-num {
+      width:22px; height:22px; border-radius:50%; background:var(--accent);
+      color:#fff; font-size:11px; font-weight:800;
+      display:flex; align-items:center; justify-content:center; flex-shrink:0; margin-top:1px;
+    }
+    .guide-step-num.teal { background:var(--teal); }
+    .guide-step-text { font-size:13px; color:var(--muted); line-height:1.5; }
+    .guide-email-box {
+      background:var(--bg); border:1px solid var(--border); border-radius:10px;
+      padding:14px 16px; margin-bottom:10px;
+    }
+    .guide-email-type { font-weight:700; font-size:13px; margin-bottom:5px; }
+    .guide-email-desc { font-size:12.5px; color:var(--muted); line-height:1.5; }
 
     /* ── Admin tabs ────────────────────────────── */
     .tab-row { display:flex; gap:6px; margin-bottom:24px; }
@@ -1040,6 +1381,7 @@
       </div>
       <div class="user-pill">
         <div id="live-clock" style="font-family:var(--mono);font-size:13px;color:var(--accent);"></div>
+        <button class="help-btn" onclick="openGuide()">❓ Guide</button>
         <button class="signout-btn" onclick="doSignOut()">Sign out</button>
       </div>
     </div>
@@ -1085,11 +1427,11 @@
           <thead>
             <tr>
               <th>Name</th><th>Designation</th><th>Shift</th>
-              <th>Check In</th><th>Check Out</th><th>Hours</th><th>Status</th>
+              <th>Today's Entries</th><th>Total Hours</th><th>Status</th>
             </tr>
           </thead>
           <tbody id="attendance-tbody">
-            <tr><td colspan="7" class="empty-state">Loading…</td></tr>
+            <tr><td colspan="6" class="empty-state">Loading…</td></tr>
           </tbody>
         </table>
       </div>
@@ -1150,6 +1492,7 @@
         </div>
       </div>
       <div class="user-pill">
+        <button class="help-btn" onclick="openGuide()">❓ Guide</button>
         <button class="signout-btn" onclick="doSignOut()">Sign out</button>
       </div>
     </div>
@@ -1167,14 +1510,17 @@
 
     <div class="time-grid">
       <div class="time-box">
-        <div class="time-label">Check In</div>
+        <div class="time-label">First In</div>
         <div class="time-value" id="display-in" style="color:var(--accent);">—</div>
       </div>
       <div class="time-box">
-        <div class="time-label">Check Out</div>
+        <div class="time-label">Last Out</div>
         <div class="time-value" id="display-out" style="color:var(--accent2);">—</div>
       </div>
     </div>
+
+    <!-- Today's all entry/exit pairs shown inline -->
+    <div id="today-entries" style="display:none;background:var(--card);border:1px solid var(--border);border-radius:12px;padding:12px 14px;margin-bottom:14px;"></div>
 
     <div class="action-row">
       <button class="btn btn-primary" id="btn-checkin" onclick="askConfirmCheckIn()">✅ Check In</button>
@@ -1182,10 +1528,13 @@
     </div>
 
     <div style="margin-top:14px;background:var(--card);border:1px solid var(--border);border-radius:12px;padding:14px 16px;font-size:13px;color:var(--muted);">
-      💡 Each check-in/out asks you to confirm first, then automatically emails the society office — no extra steps needed.
+      💡 Each check-in/out asks you to confirm first, then automatically emails the society office — no extra steps needed. You can check in and out multiple times in a day.
     </div>
 
-    <div class="section-title" style="margin-top:28px;">📅 My Recent Attendance</div>
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-top:28px;margin-bottom:8px;">
+      <div class="section-title" style="margin:0;">📅 My Attendance History</div>
+      <button class="btn btn-secondary" style="width:auto;padding:9px 14px;font-size:13px;" onclick="exportMyHistoryCSV()">⬇ Export CSV</button>
+    </div>
     <div id="my-history-list" class="history-list">
       <div class="empty-state">Loading…</div>
     </div>
@@ -1261,11 +1610,11 @@
       <table>
         <thead>
           <tr>
-            <th>Date</th><th>Check In</th><th>Check Out</th><th>Hours</th><th>Status</th>
+            <th>Date</th><th>Entries</th><th>Total Hours</th><th>Status</th>
           </tr>
         </thead>
         <tbody id="history-tbody">
-          <tr><td colspan="5" class="empty-state">Loading…</td></tr>
+          <tr><td colspan="4" class="empty-state">Loading…</td></tr>
         </tbody>
       </table>
     </div>
@@ -1287,6 +1636,243 @@
     <div style="margin-top:14px;font-size:12px;color:var(--muted);">
       📧 This will also notify your society admin automatically.
     </div>
+  </div>
+</div>
+
+<!-- ════════════════════════════════════════════════
+     APP GUIDE MODAL
+════════════════════════════════════════════════ -->
+<div id="guide-modal" class="modal-overlay hidden" onclick="closeGuide()">
+  <div class="modal-box" onclick="event.stopPropagation()" style="position:relative;">
+
+    <!-- Header -->
+    <div class="guide-header">
+      <button class="guide-close" onclick="closeGuide()">✕</button>
+      <h2>📖 How to Use This App</h2>
+      <p>Society Attendance Portal — complete guide for admins and staff</p>
+    </div>
+
+    <div class="guide-body">
+
+      <!-- WHO DOES WHAT -->
+      <div class="guide-section">
+        <div class="guide-section-title">👥 Two Roles — One App</div>
+
+        <div class="guide-role-card admin-card">
+          <div class="guide-role-title">🏢 Admin (Society Office)</div>
+          <div class="guide-step">
+            <div class="guide-step-num">1</div>
+            <div class="guide-step-text">Register once using <b>Register Admin</b> tab — enter your society name, email &amp; password. This creates the office account.</div>
+          </div>
+          <div class="guide-step">
+            <div class="guide-step-num">2</div>
+            <div class="guide-step-text">After logging in, go to <b>Manage Staff</b> tab → fill in each staff member's name, their email (the one they'll use to log in), designation, and shift timings → click <b>Add Staff Member</b>.</div>
+          </div>
+          <div class="guide-step">
+            <div class="guide-step-num">3</div>
+            <div class="guide-step-text">The <b>Attendance</b> tab shows today's live records for all staff — updates in real time as staff check in/out from their phones.</div>
+          </div>
+          <div class="guide-step">
+            <div class="guide-step-num">4</div>
+            <div class="guide-step-text">Click any staff card in <b>Manage Staff</b> to open their full date-range history and export it as CSV.</div>
+          </div>
+        </div>
+
+        <div class="guide-role-card staff-card">
+          <div class="guide-role-title">👤 Staff (Housekeeping / Security / etc.)</div>
+          <div class="guide-step">
+            <div class="guide-step-num teal">1</div>
+            <div class="guide-step-text">Open this same link on your phone. Tap <b>Sign in with Google</b> — use the <b>exact same email</b> the admin entered for you when adding you as staff.</div>
+          </div>
+          <div class="guide-step">
+            <div class="guide-step-num teal">2</div>
+            <div class="guide-step-text">Your name, designation, and shift load automatically — no setup needed.</div>
+          </div>
+          <div class="guide-step">
+            <div class="guide-step-num teal">3</div>
+            <div class="guide-step-text">Tap <b>✅ Check In</b> when you arrive. A confirmation popup shows the exact time — tap <b>Confirm Entry</b> to save it.</div>
+          </div>
+          <div class="guide-step">
+            <div class="guide-step-num teal">4</div>
+            <div class="guide-step-text">Tap <b>🏁 Check Out</b> when you leave. If you go for lunch and come back, just tap <b>Check In</b> again — multiple entries per day are supported.</div>
+          </div>
+          <div class="guide-step">
+            <div class="guide-step-num teal">5</div>
+            <div class="guide-step-text">Scroll down to see your last 14 days of attendance. Tap <b>⬇ Export CSV</b> to download your full personal attendance record.</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- BUTTONS -->
+      <div class="guide-section">
+        <div class="guide-section-title">🔘 What Every Button Does</div>
+
+        <div class="guide-item">
+          <div class="guide-icon purple">🔑</div>
+          <div>
+            <div class="guide-item-title">Sign in with Google <span class="guide-badge both">Admin &amp; Staff</span></div>
+            <div class="guide-item-desc">Opens Google's secure login screen. Admins can use any Google account. Staff <b>must</b> use the exact email the admin registered them with — otherwise they'll see "Account not recognised."</div>
+          </div>
+        </div>
+
+        <div class="guide-item">
+          <div class="guide-icon purple">📝</div>
+          <div>
+            <div class="guide-item-title">Register Admin <span class="guide-badge admin">Admin only</span></div>
+            <div class="guide-item-desc">Creates a new society office account using email &amp; password. Each society registers separately — their data is completely private from other societies. Staff do NOT register here.</div>
+          </div>
+        </div>
+
+        <div class="guide-item">
+          <div class="guide-icon purple">➕</div>
+          <div>
+            <div class="guide-item-title">Add Staff Member <span class="guide-badge admin">Admin only</span></div>
+            <div class="guide-item-desc">Adds a new staff profile. The <b>email field here is what that person must use to log in</b> — make sure it matches their Google account email exactly. Once added, they can immediately sign in.</div>
+          </div>
+        </div>
+
+        <div class="guide-item">
+          <div class="guide-icon purple">✏️</div>
+          <div>
+            <div class="guide-item-title">Edit Staff (pencil icon) <span class="guide-badge admin">Admin only</span></div>
+            <div class="guide-item-desc">Changes a staff member's name, designation, or shift timings. Email cannot be edited (it's the login key) — to change email, delete and re-add the staff member.</div>
+          </div>
+        </div>
+
+        <div class="guide-item">
+          <div class="guide-icon pink">🗑️</div>
+          <div>
+            <div class="guide-item-title">Delete Staff (bin icon) <span class="guide-badge admin">Admin only</span></div>
+            <div class="guide-item-desc">Permanently removes that staff profile. Their past attendance records stay in the database but they can no longer log in to mark attendance.</div>
+          </div>
+        </div>
+
+        <div class="guide-item">
+          <div class="guide-icon purple">👤 card</div>
+          <div>
+            <div class="guide-item-title">Click a Staff Card <span class="guide-badge admin">Admin only</span></div>
+            <div class="guide-item-desc">Opens that staff member's full attendance history. Pick a "From" and "To" date → click <b>Search</b> (or just change the dates — it auto-searches). Use <b>⬇ Export</b> to download their records as a CSV spreadsheet.</div>
+          </div>
+        </div>
+
+        <div class="guide-item">
+          <div class="guide-icon teal">✅</div>
+          <div>
+            <div class="guide-item-title">Check In <span class="guide-badge staff">Staff only</span></div>
+            <div class="guide-item-desc">Marks your arrival time. Opens a confirmation popup showing the exact current time — tap <b>Confirm Entry</b> to save. This also automatically emails the admin. You can check in again after a lunch break.</div>
+          </div>
+        </div>
+
+        <div class="guide-item">
+          <div class="guide-icon pink">🏁</div>
+          <div>
+            <div class="guide-item-title">Check Out <span class="guide-badge staff">Staff only</span></div>
+            <div class="guide-item-desc">Marks your departure time. Only becomes active after you've checked in. Opens a confirmation popup — tap <b>Confirm Exit</b> to save. Admin is notified automatically.</div>
+          </div>
+        </div>
+
+        <div class="guide-item">
+          <div class="guide-icon amber">📊</div>
+          <div>
+            <div class="guide-item-title">Export CSV <span class="guide-badge both">Admin &amp; Staff</span></div>
+            <div class="guide-item-desc"><b>Admin — Today's records:</b> exports all staff's attendance for today in one spreadsheet.<br><b>Admin — Staff history:</b> exports one staff member's records for the selected date range.<br><b>Staff:</b> exports your complete personal attendance history — use this as proof of your attendance.</div>
+          </div>
+        </div>
+
+        <div class="guide-item">
+          <div class="guide-icon blue">🔍</div>
+          <div>
+            <div class="guide-item-title">Search (date filter) <span class="guide-badge admin">Admin only</span></div>
+            <div class="guide-item-desc">Filters a staff member's history to the chosen date range. Also triggers automatically when you change either date picker — no need to click Search manually.</div>
+          </div>
+        </div>
+
+        <div class="guide-item">
+          <div class="guide-icon green">🔒</div>
+          <div>
+            <div class="guide-item-title">Forgot Password <span class="guide-badge admin">Admin only</span></div>
+            <div class="guide-item-desc">Sends a password reset link to the admin's email. Works only for email/password accounts — Google Sign-In accounts are managed by Google directly.</div>
+          </div>
+        </div>
+
+        <div class="guide-item">
+          <div class="guide-icon pink">↩️</div>
+          <div>
+            <div class="guide-item-title">Sign Out <span class="guide-badge both">Admin &amp; Staff</span></div>
+            <div class="guide-item-desc">Securely logs out the current user. The next person to open the app will see the login screen fresh — important on shared devices.</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- EMAILS -->
+      <div class="guide-section">
+        <div class="guide-section-title">📧 How Emails Work</div>
+
+        <div class="guide-email-box">
+          <div class="guide-email-type">✅ Check-In Notification</div>
+          <div class="guide-email-desc">
+            Sent automatically to the <b>admin's registered email</b> the moment a staff member confirms their check-in. Contains the staff member's name, email, check-in time, and date.
+            The admin does not need to do anything — the email just arrives in their inbox.
+          </div>
+        </div>
+
+        <div class="guide-email-box">
+          <div class="guide-email-type">🏁 Check-Out Notification</div>
+          <div class="guide-email-desc">
+            Same as above but for check-out. Also sent automatically to the admin on confirmation. If a staff member checks in and out multiple times (e.g. lunch break), an email is sent for each event.
+          </div>
+        </div>
+
+        <div class="guide-email-box">
+          <div class="guide-email-type">🔒 Password Reset Email</div>
+          <div class="guide-email-desc">
+            Sent by Firebase (Google) directly to the admin's registered email when "Forgot password?" is clicked. Contains a secure link to set a new password. Valid for 1 hour.
+          </div>
+        </div>
+
+        <div class="guide-email-box">
+          <div class="guide-email-type" style="color:var(--accent2);">⚠️ If Staff Show "Account Not Recognised"</div>
+          <div class="guide-email-desc">
+            This means the email they signed in with (their Google account email) does not match what the admin typed when adding them. Ask the admin to check the email in <b>Manage Staff</b> and correct it — or the staff member should try a different Google account that matches the registered email.
+          </div>
+        </div>
+      </div>
+
+      <!-- MULTIPLE CHECK-INS -->
+      <div class="guide-section">
+        <div class="guide-section-title">🔄 Multiple Check-Ins Per Day</div>
+        <div class="guide-item">
+          <div class="guide-icon teal">🍽️</div>
+          <div>
+            <div class="guide-item-title">Lunch Breaks &amp; Return Visits</div>
+            <div class="guide-item-desc">
+              Staff can check in and out as many times as needed in one day. Example: arrive at 9 AM → check in. Leave for lunch at 1 PM → check out. Return at 2 PM → check in again. Leave at 6 PM → check out again.<br><br>
+              The app stores all entry pairs (9–1, 2–6). <b>Total hours</b> adds them together (8h 00m). The admin's attendance table shows all pairs for the day. Each pair appears on its own row in the CSV export with an Entry# column.
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- PRIVACY & DATA -->
+      <div class="guide-section">
+        <div class="guide-section-title">🔐 Privacy &amp; Data</div>
+        <div class="guide-item">
+          <div class="guide-icon purple">🏢</div>
+          <div>
+            <div class="guide-item-title">Each Society's Data is Isolated</div>
+            <div class="guide-item-desc">When you register as a new admin (e.g. "Ratna Apt" and "Mansi Residency"), each society's staff and attendance are completely separate. One society can never see another's records.</div>
+          </div>
+        </div>
+        <div class="guide-item">
+          <div class="guide-icon green">☁️</div>
+          <div>
+            <div class="guide-item-title">Data is Stored in Firebase (Google Cloud)</div>
+            <div class="guide-item-desc">All attendance records, staff profiles, and admin accounts are stored securely in Google Firestore. Data persists permanently — closing or refreshing the browser does not lose any records. Historical records are available forever.</div>
+          </div>
+        </div>
+      </div>
+
+    </div><!-- end guide-body -->
   </div>
 </div>
 
