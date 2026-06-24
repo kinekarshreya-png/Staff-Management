@@ -144,7 +144,7 @@ window.adminRegister = async () => {
   if(pass.length<6){showToast("Password must be at least 6 characters","warn");return;}
   try{
     const cred=await createUserWithEmailAndPassword(auth,email,pass);
-    await setDoc(doc(db,"admins",cred.user.uid),{email,society,createdAt:serverTimestamp()});
+    await setDoc(doc(db,"admins",cred.user.uid),{email,society,notificationEmail: email,createdAt:serverTimestamp()});
     showToast("Admin account created!","success");
   }catch(e){showToast(e.message,"error");}
 };
@@ -505,7 +505,7 @@ async function notifyAdmin(action) {
     if(!staffProfile.adminUid) return;
     const as=await getDoc(doc(db,"admins",staffProfile.adminUid));
     if(!as.exists()) return;
-    await sendEmail({staffName:staffProfile.name,staffEmail:staffProfile.email,action,time,adminEmail:as.data().email,societyName:as.data().society});
+    await sendEmail({staffName: staffProfile.name,staffEmail: staffProfile.email,action, time,adminEmail: as.data().notificationEmail || as.data().email, societyName: as.data().society});
   }catch(e){console.error(e);}
 }
 
