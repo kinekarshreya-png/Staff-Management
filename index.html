@@ -167,14 +167,19 @@ window.doSignOut = async () => {
 
 // ── ADMIN DASHBOARD ───────────────────────────────────────────────────────────
 function loadAdminDashboard() {
-  showSection("admin-section");
-  $("admin-society").textContent=$("admin-society-sub").textContent=adminProfile.society;
-  $("admin-email-lbl").textContent=adminProfile.email;
-  $("admin-date").textContent=todayFull();
-  startClock("admin-clock");
-  showAdminTab("attendance");
-  loadStaffList();
-  loadTodayAttendance();
+  try {
+    showSection("admin-section");
+    const socEl=$("admin-society"); if(socEl) socEl.textContent=adminProfile.society||"Society";
+    const emlEl=$("admin-email-lbl"); if(emlEl) emlEl.textContent=adminProfile.email||"";
+    const dtEl=$("admin-date"); if(dtEl) dtEl.textContent=todayFull();
+    startClock("admin-clock");
+    showAdminTab("attendance");
+    loadStaffList();
+    loadTodayAttendance();
+  } catch(e) {
+    console.error("loadAdminDashboard error:", e);
+    showToast("Dashboard error: "+e.message, "error");
+  }
 }
 
 function loadStaffList() {
