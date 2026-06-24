@@ -180,11 +180,24 @@ function loadAdminDashboard() {
 function loadStaffList() {
   const el=$("staff-list-admin"); unsubStaff&&unsubStaff();
   const q=query(collection(db,"staff"),where("adminUid","==",currentUser.uid));
-  unsubStaff=onSnapshot(q,snap=>{
-    const staff=snap.docs.map(d=>({id:d.id,...d.data()}));
-    renderStaffList(staff,el);
-    loadTodayAttendance(staff);
-  });
+  el.innerHTML='<div class="empty-state">Loading...</div>';
+  unsubStaff=onSnapshot(q,
+    snap=>{
+      const staff=snap.docs.map(d=>({id:d.id,...d.data()}));
+      renderStaffList(staff,el);
+      loadTodayAttendance(staff);
+    },
+    err=>{
+      console.error("Staff list error:",err);
+      if(err.code==="permission-denied"){
+        el.innerHTML='<div class="empty-state" style="color:#E94F8A">⚠️ <b>Firestore rules need updating.</b> See the ❓ Guide button above — Security Rules section — for the exact rules to paste into Firebase Console.</div>';
+        showToast("⚠️ Permission denied — check Guide for Firestore rules fix","warn");
+      } else {
+        el.innerHTML='<div class="empty-state">Error: '+err.message+'</div>';
+        showToast("Staff load error: "+err.message,"error");
+      }
+    }
+  );
 }
 
 function renderStaffList(staff,container) {
@@ -236,15 +249,23 @@ async function loadTodayAttendance(staffList) {
   const key=dayKey();
   const q=query(collection(db,"attendance"),where("adminUid","==",currentUser.uid),where("date","==",key));
   unsubLogs&&unsubLogs();
-  unsubLogs=onSnapshot(q,async snap=>{
-    const logMap={}; snap.docs.forEach(d=>{logMap[d.data().staffId]=d.data();});
-    if(!staffList){
-      const sq=query(collection(db,"staff"),where("adminUid","==",currentUser.uid));
-      staffList=(await getDocs(sq)).docs.map(d=>({id:d.id,...d.data()}));
+  unsubLogs=onSnapshot(q,
+    async snap=>{
+      const logMap={}; snap.docs.forEach(d=>{logMap[d.data().staffId]=d.data();});
+      if(!staffList){
+        const sq=query(collection(db,"staff"),where("adminUid","==",currentUser.uid));
+        staffList=(await getDocs(sq)).docs.map(d=>({id:d.id,...d.data()}));
+      }
+      renderAttendanceTable(staffList,logMap);
+      renderSummaryCards(staffList,logMap);
+    },
+    err=>{
+      console.error("Attendance error:",err);
+      const tbody=$("attendance-tbody");
+      if(tbody) tbody.innerHTML='<tr><td colspan="6" class="empty-state" style="color:#E94F8A">⚠️ Permission denied — update Firestore rules. See ❓ Guide above.</td></tr>';
+      if(err.code==="permission-denied") showToast("⚠️ Firestore rules need updating — see Guide","warn");
     }
-    renderAttendanceTable(staffList,logMap);
-    renderSummaryCards(staffList,logMap);
-  });
+  );
 }
 
 function renderAttendanceTable(staff,logMap) {
@@ -948,6 +969,41 @@ tr:last-child td{border-bottom:none;}
       <div class="g-section">
         <div class="g-section-title">🔄 Multiple Check-Ins Per Day</div>
         <div class="g-item"><div class="g-icon gi-teal">🍽️</div><div><div class="g-item-title">Lunch Breaks &amp; Return Visits</div><div class="g-item-desc">Staff can check in and out any number of times in one day. Example: arrive 9 AM → check in. Leave for lunch 1 PM → check out. Return 2 PM → check in again. Leave 6 PM → check out.<br><br>All pairs (9–1 PM and 2–6 PM) are stored. Total hours = 8h 00m. The attendance table and CSV show each pair numbered (1. 9:00 AM → 1:00 PM | 2. 2:00 PM → 6:00 PM).</div></div></div>
+      </div>
+
+      <div class="g-section">
+        <div class="g-section-title">🛡️ Firestore Security Rules — Required Setup</div>
+        <div class="g-item">
+          <div class="g-icon gi-amber">⚙️</div>
+          <div>
+            <div class="g-item-title" style="color:#D97706">If staff list or attendance shows "Loading…" forever or a permission error</div>
+            <div class="g-item-desc">
+              Your Firestore database is in Production mode which blocks all reads/writes by default.
+              You need to paste these rules once:<br><br>
+              1. Go to <a href="https://console.firebase.google.com/project/society-attendance/firestore/rules" target="_blank">Firebase Console → Firestore → Rules</a><br>
+              2. Replace everything with the rules below<br>
+              3. Click <b>Publish</b><br><br>
+              <div style="background:#1F1B33;color:#A5F3FC;border-radius:8px;padding:14px;font-family:var(--mono);font-size:11.5px;line-height:1.7;white-space:pre-wrap;user-select:all;">rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    match /admins/{uid} {
+      allow read: if request.auth != null;
+      allow write: if request.auth != null
+                   && request.auth.uid == uid;
+    }
+    match /staff/{staffId} {
+      allow read: if request.auth != null;
+      allow write: if request.auth != null;
+    }
+    match /attendance/{logId} {
+      allow read, write: if request.auth != null;
+    }
+  }
+}</div>
+              <br>Click anywhere inside the code box above to select all, then copy and paste into Firebase Console.
+            </div>
+          </div>
+        </div>
       </div>
 
       <div class="g-section">
