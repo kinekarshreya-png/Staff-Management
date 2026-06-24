@@ -69,13 +69,22 @@ function loadEmailJS() {
 async function sendEmail({staffName,staffEmail,action,time,adminEmail,societyName}) {
   try {
     await loadEmailJS();
-    await emailjs.send(EMAILJS_SERVICE_ID,EMAILJS_TEMPLATE_ID,{
-      to_email:adminEmail, from_name:societyName||"Society",
-      staff_name:staffName, staff_email:staffEmail,
-      action:action==="in"?"Checked IN":"Checked OUT", time, date:new Date().toLocaleDateString("en-IN")
+    const actionText = action==="in" ? "Checked IN ✅" : "Checked OUT 🏁";
+    await emailjs.send(EMAILJS_SERVICE_ID, EMAILJS_TEMPLATE_ID, {
+      to_email:    adminEmail,
+      from_name:   societyName || "Society Office",
+      staff_name:  staffName,
+      staff_email: staffEmail,
+      action:      actionText,
+      time:        time,
+      date:        new Date().toLocaleDateString("en-IN"),
+      message:     staffName + " (" + staffEmail + ") has " + actionText + " at " + time + " on " + new Date().toLocaleDateString("en-IN") + ". — Sent automatically by " + (societyName || "Society Office")
     });
     showToast("📧 Admin notified by email","success");
-  } catch(e){ showToast("⚠️ Email failed – check EmailJS config","warn"); console.error(e); }
+  } catch(e){
+    showToast("⚠️ Email notification failed","warn");
+    console.error("EmailJS error:",e);
+  }
 }
 
 // ── UI utils ──────────────────────────────────────────────────────────────────
@@ -144,7 +153,7 @@ window.adminRegister = async () => {
   if(pass.length<6){showToast("Password must be at least 6 characters","warn");return;}
   try{
     const cred=await createUserWithEmailAndPassword(auth,email,pass);
-    await setDoc(doc(db,"admins",cred.user.uid),{email,society,notificationEmail: email,createdAt:serverTimestamp()});
+    await setDoc(doc(db,"admins",cred.user.uid),{email,society,createdAt:serverTimestamp()});
     showToast("Admin account created!","success");
   }catch(e){showToast(e.message,"error");}
 };
@@ -469,11 +478,17 @@ window.doConfirm = async () => {
   try{
     if(action==="in") await doCheckIn();
     else await doCheckOut();
-    await notifyAdmin(action);
-  }finally{
+    // Close modal immediately after save — don't wait for email
     btn.disabled=false;
     window.closeConfirm();
     loadMyHistory();
+    // Send email in background — never blocks the UI
+    notifyAdmin(action).catch(e=>console.error("notifyAdmin failed:",e));
+  }catch(e){
+    console.error("doConfirm error:",e);
+    showToast("Save failed: "+e.message,"error");
+    btn.disabled=false;
+    btn.textContent=action==="in"?"✅ Confirm Entry":"🏁 Confirm Exit";
   }
 };
 
@@ -505,7 +520,7 @@ async function notifyAdmin(action) {
     if(!staffProfile.adminUid) return;
     const as=await getDoc(doc(db,"admins",staffProfile.adminUid));
     if(!as.exists()) return;
-    await sendEmail({staffName: staffProfile.name,staffEmail: staffProfile.email,action, time,adminEmail: as.data().notificationEmail || as.data().email, societyName: as.data().society});
+    await sendEmail({staffName:staffProfile.name,staffEmail:staffProfile.email,action,time,adminEmail:as.data().email,societyName:as.data().society});
   }catch(e){console.error(e);}
 }
 
