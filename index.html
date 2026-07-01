@@ -1450,27 +1450,46 @@ tr:last-child td{border-bottom:none;}
         <div class="g-item"><div class="g-icon gi-amber">🛡️</div><div><div class="g-item-title">Step 2 — Update Firestore Rules</div><div class="g-item-desc">Copy the rules below into Firebase Console → Firestore → Rules → Publish.<div class="rules-box">rules_version = '2';
 service cloud.firestore {
   match /databases/{database}/documents {
+
     match /userRoles/{uid} {
-      allow read: if request.auth != null
-                  && request.auth.uid == uid;
-      allow write: if request.auth != null
-                   && request.auth.uid == resource.data.get('companyUid', uid);
+      // Anyone logged in can read their own role doc
+      allow read: if request.auth != null && request.auth.uid == uid;
+      // Company can write any role doc
+      // Society can write role docs BUT only staff-role docs for their own society
+      // This is needed so society admins can create and delete staff accounts
+      allow create: if request.auth != null
+        && (get(/databases/$(database)/documents/userRoles/$(request.auth.uid)).data.role == 'company'
+        || (get(/databases/$(database)/documents/userRoles/$(request.auth.uid)).data.role == 'society'
+            && request.resource.data.role == 'staff'
+            && request.resource.data.societyId == get(/databases/$(database)/documents/userRoles/$(request.auth.uid)).data.societyId));
+      allow update: if request.auth != null
+        && get(/databases/$(database)/documents/userRoles/$(request.auth.uid)).data.role == 'company';
+      allow delete: if request.auth != null
+        && (get(/databases/$(database)/documents/userRoles/$(request.auth.uid)).data.role == 'company'
+        || (get(/databases/$(database)/documents/userRoles/$(request.auth.uid)).data.role == 'society'
+            && resource.data.role == 'staff'
+            && resource.data.societyId == get(/databases/$(database)/documents/userRoles/$(request.auth.uid)).data.societyId));
     }
+
     match /societies/{societyId} {
       allow read: if request.auth != null
         && (get(/databases/$(database)/documents/userRoles/$(request.auth.uid)).data.role == 'company'
         || get(/databases/$(database)/documents/userRoles/$(request.auth.uid)).data.societyId == societyId);
       allow write: if request.auth != null
-        && get(/databases/$(database)/documents/userRoles/$(request.auth.uid)).data.role == 'company';
+        && (get(/databases/$(database)/documents/userRoles/$(request.auth.uid)).data.role == 'company'
+        || get(/databases/$(database)/documents/userRoles/$(request.auth.uid)).data.societyId == societyId);
     }
+
     match /societies/{societyId}/staff/{staffId} {
       allow read: if request.auth != null
         && (get(/databases/$(database)/documents/userRoles/$(request.auth.uid)).data.role == 'company'
         || get(/databases/$(database)/documents/userRoles/$(request.auth.uid)).data.societyId == societyId);
       allow write: if request.auth != null
         && (get(/databases/$(database)/documents/userRoles/$(request.auth.uid)).data.role == 'company'
-        || get(/databases/$(database)/documents/userRoles/$(request.auth.uid)).data.role == 'society');
+        || (get(/databases/$(database)/documents/userRoles/$(request.auth.uid)).data.role == 'society'
+            && get(/databases/$(database)/documents/userRoles/$(request.auth.uid)).data.societyId == societyId));
     }
+
     match /societies/{societyId}/attendance/{logId} {
       allow read: if request.auth != null
         && (get(/databases/$(database)/documents/userRoles/$(request.auth.uid)).data.role == 'company'
@@ -1478,6 +1497,7 @@ service cloud.firestore {
       allow write: if request.auth != null
         && get(/databases/$(database)/documents/userRoles/$(request.auth.uid)).data.societyId == societyId;
     }
+
   }
 }</div></div></div></div>
       </div>
