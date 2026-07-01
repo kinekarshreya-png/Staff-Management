@@ -127,19 +127,32 @@ async function sendNotificationEmail(vars) {
 
 // Sends login credentials to society admins and staff members
 async function sendCredsEmail(vars) {
+  // Use creds-specific template if configured, else fall back to notif template
+  const templateId = (EMAILJS_CREDS_TEMPLATE_ID && EMAILJS_CREDS_TEMPLATE_ID !== "PASTE_CREDENTIALS_TEMPLATE_ID_HERE")
+    ? EMAILJS_CREDS_TEMPLATE_ID
+    : EMAILJS_NOTIF_TEMPLATE_ID;
   try {
     await loadEmailJS();
-    await emailjs.send(EMAILJS_SERVICE_ID, EMAILJS_CREDS_TEMPLATE_ID, {
-      to_email:    vars.to_email,
-      from_name:   vars.from_name,
+    // Send with all possible variable names so it works with any template layout
+    await emailjs.send(EMAILJS_SERVICE_ID, templateId, {
+      to_email:       vars.to_email,
+      from_name:      vars.from_name,
+      staff_name:     vars.staff_name,
       recipient_name: vars.staff_name,
-      login_email: vars.staff_email,
-      temp_pass:   vars.temp_pass   || "",
-      portal_url:  vars.portal_url  || "",
-      message:     vars.message     || ""
+      staff_email:    vars.staff_email,
+      login_email:    vars.staff_email,
+      temp_pass:      vars.temp_pass  || "",
+      portal_url:     vars.portal_url || "",
+      action:         "Account Created",
+      time:           new Date().toLocaleTimeString("en-IN"),
+      date:           new Date().toLocaleDateString("en-IN"),
+      message:        vars.message    || ""
     });
-    console.log("Credentials email sent to", vars.to_email);
-  } catch(e){ console.error("Credentials email error:",e); showToast("⚠️ Could not send credentials email — check EmailJS config","warn"); }
+    showToast("📧 Credentials email sent to " + vars.to_email, "success");
+  } catch(e){
+    console.error("Credentials email error:", e);
+    showToast("⚠️ Email failed — but credentials are shown on screen above", "warn");
+  }
 }
 
 // Legacy wrapper kept for any residual calls
@@ -568,8 +581,9 @@ function renderSocietyStaffList(staff,container) {
         <div class="staff-meta">Shift: ${s.shiftStart} – ${s.shiftEnd}</div>
       </div>
       <div class="staff-actions" onclick="event.stopPropagation()">
-        <button class="icon-btn edit-btn" onclick="openEditStaff('${s.id}','${esc(s.name)}','${esc(s.email)}','${esc(s.designation||'')}','${s.shiftStart}','${s.shiftEnd}')">✏️</button>
-        <button class="icon-btn ${s.disabled?'edit-btn':'del-btn'}" onclick="toggleStaff('${s.id}','${esc(s.name)}',${s.disabled})">${s.disabled?'✅':'🚫'}</button>
+        <button class="icon-btn edit-btn" onclick="openEditStaff('${s.id}','${esc(s.name)}','${esc(s.email)}','${esc(s.designation||'')}','${s.shiftStart}','${s.shiftEnd}')" title="Edit">✏️</button>
+        <button class="icon-btn ${s.disabled?'edit-btn':'del-btn'}" onclick="toggleStaff('${s.id}','${esc(s.name)}',${s.disabled})" title="${s.disabled?'Enable':'Disable'}">${s.disabled?'✅':'🚫'}</button>
+        <button class="icon-btn" style="background:rgba(239,68,68,.1);border-color:#EF4444;color:#EF4444" onclick="openDeleteStaff('${s.id}','${esc(s.name)}')" title="Delete permanently">🗑️</button>
       </div>
     </div>`).join("");
 }
@@ -648,6 +662,36 @@ window.toggleStaff = async (id,name,isDisabled) => {
   if(!confirm(`${isDisabled?'Enable':'Disable'} ${name}?`)) return;
   await updateDoc(doc(db,"societies",societyId,"staff",id),{disabled:!isDisabled});
   showToast(`${name} ${isDisabled?'enabled':'disabled'}`,"info");
+};
+
+window.openDeleteStaff = (id,name) => {
+  $("delete-staff-id").value   = id;
+  $("delete-staff-name").textContent = name;
+  $("delete-staff-modal").classList.remove("hidden");
+};
+window.closeDeleteStaff = () => $("delete-staff-modal").classList.add("hidden");
+window.confirmDeleteStaff = async () => {
+  const id   = $("delete-staff-id").value;
+  const name = $("delete-staff-name").textContent;
+  const btn  = $("delete-staff-confirm-btn");
+  btn.disabled = true; btn.textContent = "Deleting…";
+  try{
+    // Delete staff Firestore doc
+    await deleteDoc(doc(db,"societies",societyId,"staff",id));
+    // Delete role doc — need the staff uid first
+    // Role doc uses Firebase Auth UID, not the staffId — find it
+    const rolesSnap = await getDocs(query(
+      collection(db,"userRoles"), where("staffId","==",id)
+    ));
+    for(const rd of rolesSnap.docs){ await deleteDoc(doc(db,"userRoles",rd.id)); }
+    $("delete-staff-modal").classList.add("hidden");
+    showToast(`${name} deleted permanently`,"info");
+  }catch(e){
+    showToast("Delete failed: "+e.message,"error");
+    console.error(e);
+  }finally{
+    btn.disabled=false; btn.textContent="Yes, Delete Permanently";
+  }
 };
 
 // ── Society Attendance ──────────────────────────────────────────────────────
@@ -1321,6 +1365,31 @@ tr:last-child td{border-bottom:none;}
     <div class="modal-actions">
       <button class="btn btn-secondary" onclick="closeEditModal()" style="flex:1">Cancel</button>
       <button class="btn btn-primary"   onclick="saveEdit()"       style="flex:1">Save</button>
+    </div>
+  </div>
+</div>
+
+<!-- ══ DELETE STAFF CONFIRM MODAL ════════════════════════════════════════════ -->
+<div id="delete-staff-modal" class="modal-overlay hidden" onclick="closeDeleteStaff()">
+  <div class="modal-box" onclick="event.stopPropagation()" style="text-align:center;max-width:380px;">
+    <div style="font-size:44px;margin-bottom:14px;">🗑️</div>
+    <div class="modal-title" style="margin-bottom:8px;">Delete Staff Member?</div>
+    <div style="font-size:14px;color:var(--muted);margin-bottom:6px;">
+      You are about to permanently delete:
+    </div>
+    <div id="delete-staff-name" style="font-size:17px;font-weight:800;color:var(--accent2);margin-bottom:10px;"></div>
+    <input id="delete-staff-id" type="hidden"/>
+    <div style="background:rgba(239,68,68,.08);border:1px solid rgba(239,68,68,.2);border-radius:10px;padding:12px 14px;font-size:13px;color:#B91C1C;margin-bottom:22px;text-align:left;">
+      ⚠️ <b>This cannot be undone.</b><br>
+      Their profile and login access will be removed.<br>
+      Past attendance records will remain in the system.
+    </div>
+    <div style="display:flex;gap:10px;">
+      <button class="btn btn-secondary" onclick="closeDeleteStaff()" style="flex:1;">Cancel</button>
+      <button id="delete-staff-confirm-btn" class="btn" onclick="confirmDeleteStaff()"
+        style="flex:1.4;background:#EF4444;color:#fff;border:none;">
+        Yes, Delete Permanently
+      </button>
     </div>
   </div>
 </div>
