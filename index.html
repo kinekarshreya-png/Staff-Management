@@ -3,17 +3,23 @@
 <head>
 <meta charset="UTF-8"/>
 <meta name="viewport" content="width=device-width,initial-scale=1.0"/>
-<title>Society Attendance Portal</title>
+<title>Solutions4Society — Attendance Portal</title>
 <script type="module">
+// ─────────────────────────────────────────────────────────────────────────────
+// FIREBASE CONFIG
+// ─────────────────────────────────────────────────────────────────────────────
 import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-app.js";
-import { getAuth, GoogleAuthProvider, signInWithPopup, createUserWithEmailAndPassword,
-  signInWithEmailAndPassword, sendPasswordResetEmail, signOut, onAuthStateChanged
+import {
+  getAuth, createUserWithEmailAndPassword, signInWithEmailAndPassword,
+  sendPasswordResetEmail, signOut, onAuthStateChanged, updatePassword,
+  EmailAuthProvider, reauthenticateWithCredential
 } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-auth.js";
-import { getFirestore, collection, doc, setDoc, getDoc, getDocs, updateDoc, deleteDoc,
-  onSnapshot, serverTimestamp, query, where, arrayUnion
+import {
+  getFirestore, collection, doc, setDoc, getDoc, getDocs, updateDoc,
+  deleteDoc, onSnapshot, serverTimestamp, query, where, arrayUnion,
+  orderBy, limit
 } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js";
 
-// ─── YOUR CREDENTIALS ────────────────────────────────────────────────────────
 const firebaseConfig = {
   apiKey:            "AIzaSyB2sw1RGACABcDkzJhViZOBN4cwfw0WXp0",
   authDomain:        "society-attendance.firebaseapp.com",
@@ -22,77 +28,61 @@ const firebaseConfig = {
   messagingSenderId: "913422861145",
   appId:             "1:913422861145:web:3fb37fdb4e314167ad0248"
 };
-const EMAILJS_SERVICE_ID  = "service_b1mllxr";
-const EMAILJS_TEMPLATE_ID = "template_q9jbgne";
-const EMAILJS_PUBLIC_KEY  = "wRVjKCC0cwQz6Trdt";
+const EMAILJS_SERVICE_ID         = "service_b1mllxr";
+const EMAILJS_NOTIF_TEMPLATE_ID  = "template_q9jbgne";   // check-in / check-out notifications
+const EMAILJS_CREDS_TEMPLATE_ID  = "template_illj1co"; // society & staff credential emails
+const EMAILJS_PUBLIC_KEY         = "wRVjKCC0cwQz6Trdt";
+
+// ── COMPANY MASTER UID — set this to your Solutions4Society Firebase UID ──────
+// After first login as company, check browser console for: "Company UID: xxx"
+// Then paste that UID here and re-upload the file.
+const COMPANY_UID = "26L6RbYxrMaZx8Nz8XefLTkq3eZ2";
 // ─────────────────────────────────────────────────────────────────────────────
 
 const app  = initializeApp(firebaseConfig);
 const auth = getAuth(app);
 const db   = getFirestore(app);
 
-// ── tiny helpers ──────────────────────────────────────────────────────────────
-const pad     = n => String(n).padStart(2,"0");
-const dayKey  = (d=new Date()) => `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}`;
-const fmt12   = iso => { if(!iso) return "—"; const d=new Date(iso); let h=d.getHours(),m=d.getMinutes(),ap=h>=12?"PM":"AM"; h=h%12||12; return `${h}:${pad(m)} ${ap}`; };
+// ─────────────────────────────────────────────────────────────────────────────
+// HELPERS
+// ─────────────────────────────────────────────────────────────────────────────
+const pad       = n => String(n).padStart(2,"0");
+const dayKey    = (d=new Date()) => `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}`;
+const fmt12     = iso => { if(!iso) return "—"; const d=new Date(iso); let h=d.getHours(),m=d.getMinutes(),ap=h>=12?"PM":"AM"; h=h%12||12; return `${h}:${pad(m)} ${ap}`; };
 const todayFull = () => new Date().toLocaleDateString("en-IN",{weekday:"long",year:"numeric",month:"long",day:"numeric"});
 const initials  = n => (n||"?").split(" ").map(p=>p[0]).slice(0,2).join("").toUpperCase();
 const esc       = v => (v||"").replace(/'/g,"\\'");
-const $ = id => document.getElementById(id);
+const $         = id => document.getElementById(id);
+const genId     = () => Math.random().toString(36).slice(2,10).toUpperCase();
+const genPass   = () => { const c="abcdefghijklmnpqrstuvwxyz23456789!@#"; return Array.from({length:10},()=>c[Math.floor(Math.random()*c.length)]).join(""); };
 
-// ── multi-entry helpers ───────────────────────────────────────────────────────
-const getEntries    = log => (log&&log.entries&&log.entries.length) ? log.entries : [];
-const lastEntry     = log => { const e=getEntries(log); return e.length?e[e.length-1]:null; };
-const canCheckIn    = log => { const l=lastEntry(log); return !l||l.out!==null; };
-const canCheckOut   = log => { const l=lastEntry(log); return l&&l.out===null; };
-const firstIn       = log => { const e=getEntries(log); return e.length?e[0].in:null; };
-const totalMins     = log => getEntries(log).reduce((s,e)=>{ if(!e.in||!e.out) return s; return s+Math.max(0,Math.round((new Date(e.out)-new Date(e.in))/60000)); },0);
-const fmtHours      = log => { const m=totalMins(log); if(!m) return "—"; return `${Math.floor(m/60)}h ${pad(m%60)}m`; };
-const getDuration   = (a,b) => { const m=Math.max(0,Math.round((new Date(b)-new Date(a))/60000)); return `${Math.floor(m/60)}h ${pad(m%60)}m`; };
-const isLate        = (log,shift) => { const fi=firstIn(log); if(!fi||!shift) return false; const d=new Date(fi),[sh,sm]=shift.split(":").map(Number); return (d.getHours()*60+d.getMinutes())>(sh*60+sm); };
-const entryLines    = log => getEntries(log).map((e,i)=>`${i+1}. ${fmt12(e.in)} → ${e.out?fmt12(e.out):"now"}`).join(" | ");
+// Multi-entry helpers
+const getEntries = log => (log&&log.entries&&log.entries.length)?log.entries:[];
+const lastEntry  = log => { const e=getEntries(log); return e.length?e[e.length-1]:null; };
+const canCheckIn = log => { const l=lastEntry(log); return !l||l.out!==null; };
+const canCheckOut= log => { const l=lastEntry(log); return l&&l.out===null; };
+const firstIn    = log => { const e=getEntries(log); return e.length?e[0].in:null; };
+const totalMins  = log => getEntries(log).reduce((s,e)=>{ if(!e.in||!e.out) return s; return s+Math.max(0,Math.round((new Date(e.out)-new Date(e.in))/60000)); },0);
+const fmtHours   = log => { const m=totalMins(log); if(!m) return "—"; return `${Math.floor(m/60)}h ${pad(m%60)}m`; };
+const getDur     = (a,b) => { const m=Math.max(0,Math.round((new Date(b)-new Date(a))/60000)); return `${Math.floor(m/60)}h ${pad(m%60)}m`; };
+const isLate     = (log,shift) => { const fi=firstIn(log); if(!fi||!shift) return false; const d=new Date(fi),[sh,sm]=shift.split(":").map(Number); return (d.getHours()*60+d.getMinutes())>(sh*60+sm); };
+const entryLines = log => getEntries(log).map((e,i)=>`${i+1}. ${fmt12(e.in)} → ${e.out?fmt12(e.out):"now"}`).join(" | ");
 
-// ── state ─────────────────────────────────────────────────────────────────────
-let currentUser=null, adminProfile=null, staffProfile=null, role=null;
+// ─────────────────────────────────────────────────────────────────────────────
+// STATE
+// ─────────────────────────────────────────────────────────────────────────────
+let currentUser=null, userRole=null, companyProfile=null, societyProfile=null, staffProfile=null;
+let societyId=null; // active society context
 let unsubLogs=null, unsubStaff=null, clockInterval=null, authToken=0;
 
-// ── EmailJS ───────────────────────────────────────────────────────────────────
-function loadEmailJS() {
-  return new Promise(resolve => {
-    if(window.emailjs){resolve();return;}
-    const s=document.createElement("script");
-    s.src="https://cdn.jsdelivr.net/npm/@emailjs/browser@4/dist/email.min.js";
-    s.onload=()=>{emailjs.init(EMAILJS_PUBLIC_KEY);resolve();};
-    document.head.appendChild(s);
-  });
-}
-async function sendEmail({staffName,staffEmail,action,time,adminEmail,societyName}) {
-  try {
-    await loadEmailJS();
-    const actionText = action==="in" ? "Checked IN ✅" : "Checked OUT 🏁";
-    await emailjs.send(EMAILJS_SERVICE_ID, EMAILJS_TEMPLATE_ID, {
-      to_email:    adminEmail,
-      from_name:   societyName || "Society Office",
-      staff_name:  staffName,
-      staff_email: staffEmail,
-      action:      actionText,
-      time:        time,
-      date:        new Date().toLocaleDateString("en-IN"),
-      message:     staffName + " (" + staffEmail + ") has " + actionText + " at " + time + " on " + new Date().toLocaleDateString("en-IN") + ". — Sent automatically by " + (societyName || "Society Office")
-    });
-    showToast("📧 Admin notified by email","success");
-  } catch(e){
-    showToast("⚠️ Email notification failed","warn");
-    console.error("EmailJS error:",e);
-  }
-}
-
-// ── UI utils ──────────────────────────────────────────────────────────────────
-const showSection = id => { document.querySelectorAll(".page-section").forEach(s=>s.classList.add("hidden")); $(id).classList.remove("hidden"); };
+// ─────────────────────────────────────────────────────────────────────────────
+// UI UTILS
+// ─────────────────────────────────────────────────────────────────────────────
+const showSection = id => { document.querySelectorAll(".page-section").forEach(s=>s.classList.add("hidden")); $(id)&&$(id).classList.remove("hidden"); };
 function showToast(msg,type="info") {
   const t=document.createElement("div"); t.className=`toast toast-${type}`; t.textContent=msg;
   document.body.appendChild(t); setTimeout(()=>t.classList.add("show"),10);
-  setTimeout(()=>{t.classList.remove("show");setTimeout(()=>t.remove(),400);},3500);
+  setTimeout(()=>{t.classList.remove("show");setTimeout(()=>t.remove(),400);},3800);
 }
 function startClock(id) {
   const el=$(id); if(!el) return;
@@ -100,147 +90,543 @@ function startClock(id) {
   const tick=()=>{el.textContent=new Date().toLocaleTimeString("en-IN",{hour:"2-digit",minute:"2-digit",second:"2-digit"});};
   tick(); clockInterval=setInterval(tick,1000);
 }
-window.showTab = tab => {
-  document.querySelectorAll(".auth-panel").forEach(p=>p.classList.add("hidden"));
-  document.querySelectorAll(".tab-btn").forEach(b=>b.classList.remove("active"));
-  $(`tab-${tab}`).classList.remove("hidden");
-  document.querySelector(`[data-tab="${tab}"]`).classList.add("active");
-};
-window.showAdminTab = tab => {
-  document.querySelectorAll(".admin-panel").forEach(p=>p.classList.add("hidden"));
-  document.querySelectorAll(".adm-tab-btn").forEach(b=>b.classList.remove("active"));
-  $(`apanel-${tab}`).classList.remove("hidden");
-  document.querySelector(`[data-atab="${tab}"]`).classList.add("active");
-};
-window.openGuide  = () => $("guide-modal").classList.remove("hidden");
-window.closeGuide = () => $("guide-modal").classList.add("hidden");
+function downloadCSV(rows,filename) {
+  const csv=rows.map(r=>r.map(v=>`"${String(v).replace(/"/g,'""')}"`).join(",")).join("\n");
+  const a=document.createElement("a"); a.href="data:text/csv;charset=utf-8,"+encodeURIComponent(csv); a.download=filename; a.click();
+}
 
-// ── AUTH ──────────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// EMAILJS
+// ─────────────────────────────────────────────────────────────────────────────
+function loadEmailJS() {
+  return new Promise(resolve=>{
+    if(window.emailjs){resolve();return;}
+    const s=document.createElement("script");
+    s.src="https://cdn.jsdelivr.net/npm/@emailjs/browser@4/dist/email.min.js";
+    s.onload=()=>{emailjs.init(EMAILJS_PUBLIC_KEY);resolve();};
+    document.head.appendChild(s);
+  });
+}
+// Sends check-in / check-out notifications to society admin
+async function sendNotificationEmail(vars) {
+  try {
+    await loadEmailJS();
+    await emailjs.send(EMAILJS_SERVICE_ID, EMAILJS_NOTIF_TEMPLATE_ID, {
+      to_email:    vars.to_email,
+      from_name:   vars.from_name,
+      staff_name:  vars.staff_name,
+      staff_email: vars.staff_email,
+      action:      vars.action,
+      time:        vars.time,
+      date:        vars.date,
+      message:     vars.message || ""
+    });
+    showToast("📧 Admin notified","success");
+  } catch(e){ showToast("⚠️ Notification email failed","warn"); console.error("Notification email error:",e); }
+}
+
+// Sends login credentials to society admins and staff members
+async function sendCredsEmail(vars) {
+  try {
+    await loadEmailJS();
+    await emailjs.send(EMAILJS_SERVICE_ID, EMAILJS_CREDS_TEMPLATE_ID, {
+      to_email:    vars.to_email,
+      from_name:   vars.from_name,
+      recipient_name: vars.staff_name,
+      login_email: vars.staff_email,
+      temp_pass:   vars.temp_pass   || "",
+      portal_url:  vars.portal_url  || "",
+      message:     vars.message     || ""
+    });
+    console.log("Credentials email sent to", vars.to_email);
+  } catch(e){ console.error("Credentials email error:",e); showToast("⚠️ Could not send credentials email — check EmailJS config","warn"); }
+}
+
+// Legacy wrapper kept for any residual calls
+async function sendEmail(vars) { return sendNotificationEmail(vars); }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// AUTH — ROLE ROUTING
+// ─────────────────────────────────────────────────────────────────────────────
 onAuthStateChanged(auth, async user => {
   const tok = ++authToken;
   unsubLogs&&unsubLogs(); unsubLogs=null;
   unsubStaff&&unsubStaff(); unsubStaff=null;
   clockInterval&&clearInterval(clockInterval);
-  adminProfile=null; staffProfile=null; role=null;
+  currentUser=null; userRole=null; companyProfile=null; societyProfile=null; staffProfile=null; societyId=null;
 
   if(!user){ if(tok!==authToken) return; showSection("auth-section"); return; }
   currentUser=user;
+  console.log("Logged in UID:", user.uid); // helpful for first company setup
 
-  // ── is admin? ──
-  const aSnap = await getDoc(doc(db,"admins",user.uid));
+  // Read role doc
+  const roleSnap = await getDoc(doc(db,"userRoles",user.uid));
   if(tok!==authToken) return;
-  if(aSnap.exists()){ adminProfile=aSnap.data(); role="admin"; loadAdminDashboard(); return; }
 
-  // ── is staff? match by email ──
-  const sQ=query(collection(db,"staff"),where("email","==",user.email.toLowerCase()));
-  const sSnap=await getDocs(sQ);
-  if(tok!==authToken) return;
-  if(!sSnap.empty){
-    const docs=sSnap.docs.sort((a,b)=>(b.data().createdAt?.seconds||0)-(a.data().createdAt?.seconds||0));
-    staffProfile={id:docs[0].id,...docs[0].data()};
-    if(!staffProfile.uid){ await updateDoc(doc(db,"staff",staffProfile.id),{uid:user.uid}); staffProfile.uid=user.uid; }
-    role="staff"; loadStaffDashboard(); return;
+  if(!roleSnap.exists()){
+    // Check if this is the company master account
+    if(user.uid===COMPANY_UID || COMPANY_UID==="PASTE_YOUR_COMPANY_UID_HERE"){
+      if(COMPANY_UID==="PASTE_YOUR_COMPANY_UID_HERE"){
+        showToast(`Company UID detected: ${user.uid} — paste this into COMPANY_UID in the file`,"warn");
+        console.log("Company UID:", user.uid);
+      }
+      // Auto-create role for company master
+      await setDoc(doc(db,"userRoles",user.uid),{role:"company",email:user.email,createdAt:serverTimestamp()});
+      userRole="company"; loadCompanyDashboard(); return;
+    }
+    showToast("Account not set up. Contact Solutions4Society.","warn");
+    await signOut(auth); return;
   }
 
-  showToast("Account not recognised. Contact your society admin.","warn");
-  await signOut(auth);
+  const roleData = roleSnap.data();
+  userRole = roleData.role;
+
+  if(userRole==="company"){ loadCompanyDashboard(); return; }
+
+  if(userRole==="society"){
+    societyId = roleData.societyId;
+    const sSnap = await getDoc(doc(db,"societies",societyId));
+    if(tok!==authToken) return;
+    if(!sSnap.exists()){ showToast("Society not found","error"); await signOut(auth); return; }
+    societyProfile = {id:societyId,...sSnap.data()};
+    // Check if first login — force password change
+    if(societyProfile.mustChangePassword){
+      showSection("change-password-section");
+      $("change-pass-title").textContent = "Welcome to "+societyProfile.name;
+      $("change-pass-subtitle").textContent = "Please set a new password before continuing.";
+      return;
+    }
+    loadSocietyDashboard(); return;
+  }
+
+  if(userRole==="staff"){
+    societyId = roleData.societyId;
+    const staffSnap = await getDoc(doc(db,"societies",societyId,"staff",roleData.staffId));
+    if(tok!==authToken) return;
+    if(!staffSnap.exists()){ showToast("Staff profile not found","error"); await signOut(auth); return; }
+    staffProfile = {id:staffSnap.id,...staffSnap.data()};
+    if(staffProfile.disabled){ showToast("Your account has been disabled. Contact your society office.","warn"); await signOut(auth); return; }
+    // Check first login
+    if(staffProfile.mustChangePassword){
+      showSection("change-password-section");
+      $("change-pass-title").textContent = "Welcome, "+staffProfile.name;
+      $("change-pass-subtitle").textContent = "Please set a new password to continue.";
+      return;
+    }
+    loadStaffDashboard(); return;
+  }
 });
 
-window.googleSignIn = async () => { try{ await signInWithPopup(auth,new GoogleAuthProvider()); }catch(e){showToast(e.message,"error");} };
-window.adminRegister = async () => {
-  const email=$("reg-email").value.trim(), pass=$("reg-pass").value, society=$("reg-society").value.trim();
-  if(!email||!pass||!society){showToast("Fill all fields","warn");return;}
-  if(pass.length<6){showToast("Password must be at least 6 characters","warn");return;}
-  try{
-    const cred=await createUserWithEmailAndPassword(auth,email,pass);
-    await setDoc(doc(db,"admins",cred.user.uid),{email,society,createdAt:serverTimestamp()});
-    showToast("Admin account created!","success");
-  }catch(e){showToast(e.message,"error");}
-};
-window.adminLogin = async () => {
+// ─────────────────────────────────────────────────────────────────────────────
+// AUTH ACTIONS
+// ─────────────────────────────────────────────────────────────────────────────
+window.doLogin = async () => {
   const email=$("login-email").value.trim(), pass=$("login-pass").value;
   if(!email||!pass){showToast("Enter email and password","warn");return;}
-  try{ await signInWithEmailAndPassword(auth,email,pass); }catch(e){ showToast("Login failed: "+e.message,"error"); }
+  const btn=$("login-btn"); btn.disabled=true; btn.textContent="Signing in…";
+  try{ await signInWithEmailAndPassword(auth,email,pass); }
+  catch(e){ showToast("Login failed: "+e.message,"error"); btn.disabled=false; btn.textContent="Sign In →"; }
 };
-window.forgotPassword = async () => {
+
+window.doForgotPassword = async () => {
   const email=$("login-email").value.trim();
   if(!email){showToast("Enter your email first","warn");return;}
-  try{ await sendPasswordResetEmail(auth,email); showToast("Reset link sent to "+email,"success"); }catch(e){showToast(e.message,"error");}
+  try{ await sendPasswordResetEmail(auth,email); showToast("Reset link sent to "+email,"success"); }
+  catch(e){showToast(e.message,"error");}
 };
+
 window.doSignOut = async () => {
   unsubLogs&&unsubLogs(); unsubStaff&&unsubStaff(); clearInterval(clockInterval);
-  const aBody=$("attendance-tbody"); if(aBody) aBody.innerHTML=`<tr><td colspan="6" class="empty-state">Loading…</td></tr>`;
-  const sList=$("staff-list-admin"); if(sList) sList.innerHTML="";
-  adminProfile=staffProfile=role=null; await signOut(auth);
+  await signOut(auth);
 };
 
-// ── ADMIN DASHBOARD ───────────────────────────────────────────────────────────
-function loadAdminDashboard() {
-  try {
-    showSection("admin-section");
-    const socEl=$("admin-society"); if(socEl) socEl.textContent=adminProfile.society||"Society";
-    const emlEl=$("admin-email-lbl"); if(emlEl) emlEl.textContent=adminProfile.email||"";
-    const dtEl=$("admin-date"); if(dtEl) dtEl.textContent=todayFull();
-    startClock("admin-clock");
-    showAdminTab("attendance");
-    loadStaffList();
-    loadTodayAttendance();
-  } catch(e) {
-    console.error("loadAdminDashboard error:", e);
-    showToast("Dashboard error: "+e.message, "error");
+// Force password change on first login
+window.doChangePassword = async () => {
+  const newPass  = $("new-pass-1").value;
+  const confirm  = $("new-pass-2").value;
+  if(newPass.length<8){showToast("Password must be at least 8 characters","warn");return;}
+  if(newPass!==confirm){showToast("Passwords do not match","warn");return;}
+  const btn=$("change-pass-btn"); btn.disabled=true; btn.textContent="Saving…";
+  try{
+    await updatePassword(currentUser, newPass);
+    // Clear mustChangePassword flag
+    if(userRole==="society"){ await updateDoc(doc(db,"societies",societyId),{mustChangePassword:false}); }
+    if(userRole==="staff")  { await updateDoc(doc(db,"societies",societyId,"staff",staffProfile.id),{mustChangePassword:false}); }
+    showToast("Password changed! Welcome.","success");
+    // Re-route
+    if(userRole==="society") loadSocietyDashboard();
+    if(userRole==="staff")   loadStaffDashboard();
+  }catch(e){
+    if(e.code==="auth/requires-recent-login"){
+      showToast("Session expired. Please log in again.","warn"); await signOut(auth);
+    } else { showToast(e.message,"error"); }
+    btn.disabled=false; btn.textContent="Set New Password";
   }
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ══════════════════════════════════════════════════════════════════════════════
+//  COMPANY PANEL
+// ══════════════════════════════════════════════════════════════════════════════
+// ─────────────────────────────────────────────────────────────────────────────
+async function loadCompanyDashboard() {
+  showSection("company-section");
+  startClock("company-clock");
+  showCompanyTab("societies");
+  loadAllSocieties();
 }
 
-function loadStaffList() {
-  const el=$("staff-list-admin"); unsubStaff&&unsubStaff();
-  const q=query(collection(db,"staff"),where("adminUid","==",currentUser.uid));
-  el.innerHTML='<div class="empty-state">Loading...</div>';
+window.showCompanyTab = tab => {
+  document.querySelectorAll(".co-panel").forEach(p=>p.classList.add("hidden"));
+  document.querySelectorAll(".co-tab-btn").forEach(b=>b.classList.remove("active"));
+  $(`copanel-${tab}`).classList.remove("hidden");
+  document.querySelector(`[data-cotab="${tab}"]`).classList.add("active");
+  if(tab==="societies") loadAllSocieties();
+  if(tab==="staff")     loadAllStaff();
+  if(tab==="reports")   loadCompanyReports();
+};
+
+// ── Create Society ──────────────────────────────────────────────────────────
+window.createSociety = async () => {
+  const name    = $("co-soc-name").value.trim();
+  const email   = $("co-soc-email").value.trim().toLowerCase();
+  const address = $("co-soc-address").value.trim();
+  const contact = $("co-soc-contact").value.trim();
+  if(!name||!email){showToast("Society name and email are required","warn");return;}
+
+  const btn=$("create-soc-btn"); btn.disabled=true; btn.textContent="Creating…";
+  try{
+    const societyId = genId();
+    const tempPass  = genPass();
+    const portalUrl = `${window.location.origin}${window.location.pathname}?society=${societyId}`;
+
+    // 1. Create Firebase Auth account for the society
+    // We use a second app instance trick to avoid logging out the company admin
+    const {initializeApp:initApp2} = await import("https://www.gstatic.com/firebasejs/10.12.2/firebase-app.js");
+    const {getAuth:getAuth2,createUserWithEmailAndPassword:createUser2,signOut:signOut2} = await import("https://www.gstatic.com/firebasejs/10.12.2/firebase-auth.js");
+    const app2  = initApp2(firebaseConfig,"secondary");
+    const auth2 = getAuth2(app2);
+    const cred  = await createUser2(auth2,email,tempPass);
+    const uid   = cred.user.uid;
+    await signOut2(auth2);
+
+    // 2. Write society doc
+    await setDoc(doc(db,"societies",societyId),{
+      name, email, address:address||"", contact:contact||"",
+      societyId, uid, portalUrl,
+      mustChangePassword:true,
+      disabled:false,
+      createdAt:serverTimestamp(),
+      createdBy:currentUser.uid
+    });
+
+    // 3. Write role doc
+    await setDoc(doc(db,"userRoles",uid),{
+      role:"society", societyId, email, createdAt:serverTimestamp()
+    });
+
+    // 4. Send welcome + credentials email
+    await sendCredsEmail({
+      to_email:       email,
+      from_name:      "Solutions4Society",
+      staff_name:     name,
+      staff_email:    email,
+      temp_pass:      tempPass,
+      portal_url:     portalUrl,
+      message:        `Welcome to Solutions4Society!\n\nYour society attendance portal is ready.\n\nSociety: ${name}\nPortal Link: ${portalUrl}\nLogin Email: ${email}\nTemporary Password: ${tempPass}\n\nIMPORTANT: Log in and change your password immediately.\n\n— Solutions4Society`
+    });
+
+    // Clear form
+    ["co-soc-name","co-soc-email","co-soc-address","co-soc-contact"].forEach(f=>$(f).value="");
+    showToast(`${name} created! Credentials sent to ${email}`,"success");
+
+    // Show credentials in UI (in case email fails)
+    $("new-soc-creds").innerHTML=`
+      <div class="creds-box">
+        <div class="creds-title">✅ Society Created — Save these credentials</div>
+        <div class="cred-row"><span>Society:</span><b>${name}</b></div>
+        <div class="cred-row"><span>Portal URL:</span><a href="${portalUrl}" target="_blank">${portalUrl}</a></div>
+        <div class="cred-row"><span>Login Email:</span><b>${email}</b></div>
+        <div class="cred-row"><span>Temp Password:</span><b class="mono">${tempPass}</b></div>
+        <div class="cred-note">⚠️ Society must change password on first login. These credentials are not stored.</div>
+      </div>`;
+    loadAllSocieties();
+  }catch(e){
+    showToast("Failed to create society: "+e.message,"error");
+    console.error(e);
+  }finally{ btn.disabled=false; btn.textContent="Create Society"; }
+};
+
+// ── All Societies ───────────────────────────────────────────────────────────
+async function loadAllSocieties() {
+  const el=$("co-societies-list"); if(!el) return;
+  el.innerHTML=`<div class="empty-state">Loading…</div>`;
+  try{
+    const snap=await getDocs(collection(db,"societies"));
+    const societies=snap.docs.map(d=>({id:d.id,...d.data()}));
+    if(!societies.length){el.innerHTML=`<div class="empty-state">No societies yet. Create one above.</div>`;return;}
+    el.innerHTML=societies.map(s=>`
+      <div class="soc-card ${s.disabled?'soc-disabled':''}">
+        <div class="soc-card-left">
+          <div class="savatar">${initials(s.name)}</div>
+          <div>
+            <div class="staff-name">${s.name} ${s.disabled?'<span class="badge-disabled">Disabled</span>':''}</div>
+            <div class="staff-meta">${s.email} · ${s.contact||'No contact'}</div>
+            <div class="staff-meta mono" style="font-size:11px">${s.portalUrl||''}</div>
+          </div>
+        </div>
+        <div class="staff-actions" style="gap:6px">
+          <button class="icon-btn" onclick="viewSocietyAsCompany('${s.id}')" title="View attendance">👁️</button>
+          <button class="icon-btn" onclick="copySocietyLink('${esc(s.portalUrl||'')}')" title="Copy link">🔗</button>
+          <button class="icon-btn" onclick="resendSocietyCreds('${s.id}','${esc(s.name)}','${esc(s.email)}')" title="Resend credentials">📧</button>
+          <button class="icon-btn ${s.disabled?'edit-btn':'del-btn'}" onclick="toggleSociety('${s.id}',${s.disabled},'${esc(s.name)}')" title="${s.disabled?'Enable':'Disable'}">${s.disabled?'✅':'🚫'}</button>
+        </div>
+      </div>`).join("");
+  }catch(e){el.innerHTML=`<div class="empty-state">Error: ${e.message}</div>`;}
+}
+
+window.copySocietyLink = url => {
+  navigator.clipboard.writeText(url).then(()=>showToast("Link copied!","success")).catch(()=>showToast("Copy failed","warn"));
+};
+
+window.resendSocietyCreds = async (id,name,email) => {
+  const tempPass=genPass();
+  // Reset password via admin SDK not available client-side — send reset link instead
+  try{
+    await sendPasswordResetEmail(auth,email);
+    showToast(`Password reset link sent to ${email}`,"success");
+    await sendCredsEmail({
+      to_email:    email,
+      from_name:   "Solutions4Society",
+      staff_name:  name,
+      staff_email: email,
+      temp_pass:   "(sent via secure reset link)",
+      portal_url:  "",
+      message:     `Hello ${name},\n\nA password reset link has been sent to this email.\nPlease check your inbox, click the reset link, and set a new password to access your society portal.\n\n— Solutions4Society`
+    });
+  }catch(e){showToast(e.message,"error");}
+};
+
+window.toggleSociety = async (id,isDisabled,name) => {
+  if(!confirm(`${isDisabled?'Enable':'Disable'} ${name}?`)) return;
+  await updateDoc(doc(db,"societies",id),{disabled:!isDisabled});
+  showToast(`${name} ${isDisabled?'enabled':'disabled'}`,"info");
+  loadAllSocieties();
+};
+
+window.viewSocietyAsCompany = async (id) => {
+  // Company views a society's attendance — open in a modal
+  const snap=await getDoc(doc(db,"societies",id));
+  if(!snap.exists()) return;
+  const soc={id,...snap.data()};
+  $("co-view-modal-title").textContent="📋 "+soc.name+" — Today's Attendance";
+  $("co-view-modal").classList.remove("hidden");
+  const tbody=$("co-view-tbody");
+  tbody.innerHTML=`<tr><td colspan="5" class="empty-state">Loading…</td></tr>`;
+  const key=dayKey();
+  const staffSnap=await getDocs(collection(db,"societies",id,"staff"));
+  const staff=staffSnap.docs.map(d=>({id:d.id,...d.data()})).filter(s=>!s.disabled);
+  const attSnap=await getDocs(query(collection(db,"societies",id,"attendance"),where("date","==",key)));
+  const logMap={}; attSnap.docs.forEach(d=>{logMap[d.data().staffId]=d.data();});
+  if(!staff.length){tbody.innerHTML=`<tr><td colspan="5" class="empty-state">No staff</td></tr>`;return;}
+  tbody.innerHTML=staff.map(s=>{
+    const log=logMap[s.id]||{};
+    const entries=getEntries(log);
+    const status=!entries.length?"Absent":entries.every(e=>e.out)?"Completed":"Checked In";
+    return `<tr><td><b>${s.name}</b></td><td>${s.designation||""}</td><td>${entryLines(log)||"—"}</td><td class="mono">${fmtHours(log)}</td><td><span class="sbadge sbadge-${status.toLowerCase().replace(" ","-")}">${status}</span></td></tr>`;
+  }).join("");
+};
+window.closeCoViewModal = ()=>$("co-view-modal").classList.add("hidden");
+
+// ── All Staff (cross-society) ───────────────────────────────────────────────
+async function loadAllStaff() {
+  const el=$("co-staff-list"); if(!el) return;
+  el.innerHTML=`<div class="empty-state">Loading…</div>`;
+  try{
+    const socSnap=await getDocs(collection(db,"societies"));
+    const rows=[];
+    for(const socDoc of socSnap.docs){
+      const soc={id:socDoc.id,...socDoc.data()};
+      const staffSnap=await getDocs(collection(db,"societies",soc.id,"staff"));
+      staffSnap.docs.forEach(d=>rows.push({...d.data(),id:d.id,societyName:soc.name,societyId:soc.id}));
+    }
+    if(!rows.length){el.innerHTML=`<div class="empty-state">No staff across any society</div>`;return;}
+    el.innerHTML=`<table class="co-table"><thead><tr><th>Name</th><th>Email</th><th>Designation</th><th>Society</th><th>Shift</th><th>Status</th></tr></thead><tbody>`+
+      rows.map(r=>`<tr><td><b>${r.name}</b></td><td class="mono" style="font-size:12px">${r.email}</td><td>${r.designation||""}</td><td>${r.societyName}</td><td class="mono">${r.shiftStart}–${r.shiftEnd}</td><td><span class="sbadge ${r.disabled?'sbadge-absent':'sbadge-completed'}">${r.disabled?'Disabled':'Active'}</span></td></tr>`).join("")+
+      `</tbody></table>`;
+  }catch(e){el.innerHTML=`<div class="empty-state">Error: ${e.message}</div>`;}
+}
+
+// ── Company Reports ─────────────────────────────────────────────────────────
+async function loadCompanyReports() {
+  const el=$("co-reports-list"); if(!el) return;
+  el.innerHTML=`<div class="empty-state">Loading societies…</div>`;
+  const snap=await getDocs(collection(db,"societies"));
+  const societies=snap.docs.map(d=>({id:d.id,...d.data()}));
+  el.innerHTML=societies.map(s=>`
+    <div class="soc-card">
+      <div class="soc-card-left"><div class="savatar">${initials(s.name)}</div><div><div class="staff-name">${s.name}</div><div class="staff-meta">${s.email}</div></div></div>
+      <button class="btn btn-secondary" style="width:auto;padding:8px 14px" onclick="exportSocietyReport('${s.id}','${esc(s.name)}')">⬇ Export Report</button>
+    </div>`).join("") || `<div class="empty-state">No societies</div>`;
+}
+
+window.exportSocietyReport = async (id,name) => {
+  showToast("Preparing report…","info");
+  const staffSnap=await getDocs(collection(db,"societies",id,"staff"));
+  const staff=staffSnap.docs.map(d=>({id:d.id,...d.data()}));
+  const attSnap=await getDocs(collection(db,"societies",id,"attendance"));
+  const rows=[["Society","Date","Staff Name","Email","Designation","Entry#","Check In","Check Out","Hours","Status"]];
+  const byStaff={};
+  attSnap.docs.forEach(d=>{const r=d.data(); if(!byStaff[r.staffId]) byStaff[r.staffId]=[]; byStaff[r.staffId].push(r);});
+  staff.forEach(s=>{
+    const logs=byStaff[s.id]||[];
+    logs.sort((a,b)=>a.date.localeCompare(b.date));
+    logs.forEach(r=>{
+      const entries=getEntries(r);
+      if(!entries.length){rows.push([name,r.date,s.name,s.email,s.designation||"","—","—","—","—","Absent"]);}
+      else entries.forEach((e,i)=>rows.push([name,r.date,s.name,s.email,s.designation||"",i+1,e.in?fmt12(e.in):"",e.out?fmt12(e.out):"",e.in&&e.out?getDur(e.in,e.out):"",!e.out?"Checked In":"Completed"]));
+    });
+  });
+  downloadCSV(rows,`${name.replace(/\s+/g,"_")}_full_report.csv`);
+  showToast("Report exported","success");
+};
+
+window.exportAllSocietiesReport = async () => {
+  showToast("Preparing full report…","info");
+  const socSnap=await getDocs(collection(db,"societies"));
+  const rows=[["Society","Date","Staff Name","Email","Designation","Entry#","Check In","Check Out","Hours","Status"]];
+  for(const socDoc of socSnap.docs){
+    const soc={id:socDoc.id,...socDoc.data()};
+    const staffSnap=await getDocs(collection(db,"societies",soc.id,"staff"));
+    const staff=staffSnap.docs.map(d=>({id:d.id,...d.data()}));
+    const attSnap=await getDocs(collection(db,"societies",soc.id,"attendance"));
+    const byStaff={};
+    attSnap.docs.forEach(d=>{const r=d.data(); if(!byStaff[r.staffId]) byStaff[r.staffId]=[]; byStaff[r.staffId].push(r);});
+    staff.forEach(s=>{
+      const logs=byStaff[s.id]||[];
+      logs.sort((a,b)=>a.date.localeCompare(b.date));
+      logs.forEach(r=>{
+        const entries=getEntries(r);
+        if(!entries.length){rows.push([soc.name,r.date,s.name,s.email,s.designation||"","—","—","—","—","Absent"]);}
+        else entries.forEach((e,i)=>rows.push([soc.name,r.date,s.name,s.email,s.designation||"",i+1,e.in?fmt12(e.in):"",e.out?fmt12(e.out):"",e.in&&e.out?getDur(e.in,e.out):"",!e.out?"Checked In":"Completed"]));
+      });
+    });
+  }
+  downloadCSV(rows,`all_societies_report_${dayKey()}.csv`);
+  showToast("Full report exported","success");
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ══════════════════════════════════════════════════════════════════════════════
+//  SOCIETY PANEL
+// ══════════════════════════════════════════════════════════════════════════════
+// ─────────────────────────────────────────────────────────────────────────────
+function loadSocietyDashboard() {
+  showSection("society-section");
+  $("soc-name-display").textContent = societyProfile.name;
+  $("soc-email-display").textContent= societyProfile.email;
+  $("soc-date").textContent         = todayFull();
+  startClock("soc-clock");
+  showSocietyTab("attendance");
+  loadSocietyStaff();
+  loadSocietyAttendance();
+}
+
+window.showSocietyTab = tab => {
+  document.querySelectorAll(".soc-panel").forEach(p=>p.classList.add("hidden"));
+  document.querySelectorAll(".soc-tab-btn").forEach(b=>b.classList.remove("active"));
+  $(`socpanel-${tab}`).classList.remove("hidden");
+  document.querySelector(`[data-soctab="${tab}"]`).classList.add("active");
+};
+
+// ── Society Staff CRUD ──────────────────────────────────────────────────────
+function loadSocietyStaff() {
+  const el=$("soc-staff-list"); unsubStaff&&unsubStaff();
+  const q=query(collection(db,"societies",societyId,"staff"),orderBy("name"));
+  el.innerHTML=`<div class="empty-state">Loading…</div>`;
   unsubStaff=onSnapshot(q,
     snap=>{
       const staff=snap.docs.map(d=>({id:d.id,...d.data()}));
-      renderStaffList(staff,el);
-      loadTodayAttendance(staff);
+      renderSocietyStaffList(staff,el);
+      loadSocietyAttendance(staff);
     },
     err=>{
-      console.error("Staff list error:",err);
-      if(err.code==="permission-denied"){
-        el.innerHTML='<div class="empty-state" style="color:#E94F8A">⚠️ <b>Firestore rules need updating.</b> See the ❓ Guide button above — Security Rules section — for the exact rules to paste into Firebase Console.</div>';
-        showToast("⚠️ Permission denied — check Guide for Firestore rules fix","warn");
-      } else {
-        el.innerHTML='<div class="empty-state">Error: '+err.message+'</div>';
-        showToast("Staff load error: "+err.message,"error");
-      }
+      el.innerHTML=`<div class="empty-state" style="color:var(--accent2)">⚠️ ${err.message}</div>`;
+      showToast("Error loading staff: "+err.message,"error");
     }
   );
 }
 
-function renderStaffList(staff,container) {
+function renderSocietyStaffList(staff,container) {
   if(!staff.length){container.innerHTML=`<div class="empty-state">No staff yet. Add your first member above.</div>`;return;}
   container.innerHTML=staff.map(s=>`
-    <div class="staff-card staff-clickable" onclick="openStaffHistory('${s.id}','${esc(s.name)}','${esc(s.designation)}')">
-      <div class="savatar">${initials(s.name)}</div>
+    <div class="staff-card ${s.disabled?'staff-disabled':''} staff-clickable" onclick="openStaffHistory('${s.id}','${esc(s.name)}','${esc(s.designation||'')}')">
+      <div class="savatar" style="${s.disabled?'opacity:.4':''}">${initials(s.name)}</div>
       <div class="staff-info">
-        <div class="staff-name">${s.name}</div>
+        <div class="staff-name">${s.name} ${s.disabled?'<span class="badge-disabled">Disabled</span>':''}</div>
         <div class="staff-meta">${s.designation||""} · ${s.email}</div>
         <div class="staff-meta">Shift: ${s.shiftStart} – ${s.shiftEnd}</div>
       </div>
       <div class="staff-actions" onclick="event.stopPropagation()">
-        <button class="icon-btn edit-btn" onclick="openEditStaff('${s.id}','${esc(s.name)}','${esc(s.email)}','${esc(s.designation)}','${s.shiftStart}','${s.shiftEnd}')">✏️</button>
-        <button class="icon-btn del-btn"  onclick="delStaff('${s.id}','${esc(s.name)}')">🗑</button>
+        <button class="icon-btn edit-btn" onclick="openEditStaff('${s.id}','${esc(s.name)}','${esc(s.email)}','${esc(s.designation||'')}','${s.shiftStart}','${s.shiftEnd}')">✏️</button>
+        <button class="icon-btn ${s.disabled?'edit-btn':'del-btn'}" onclick="toggleStaff('${s.id}','${esc(s.name)}',${s.disabled})">${s.disabled?'✅':'🚫'}</button>
       </div>
     </div>`).join("");
 }
 
-window.addStaff = async () => {
-  const name=$("new-name").value.trim(), email=$("new-email").value.trim().toLowerCase(),
-        desig=$("new-desig").value.trim(), shiftS=$("new-shift-start").value, shiftE=$("new-shift-end").value;
+window.addSocietyStaff = async () => {
+  const name  =$("new-name").value.trim(),   email=$("new-email").value.trim().toLowerCase();
+  const desig =$("new-desig").value.trim(),  shiftS=$("new-shift-start").value, shiftE=$("new-shift-end").value;
   if(!name||!email||!desig||!shiftS||!shiftE){showToast("Fill all fields","warn");return;}
-  const dupQ=query(collection(db,"staff"),where("adminUid","==",currentUser.uid),where("email","==",email));
-  if(!(await getDocs(dupQ)).empty){showToast("A staff member with this email already exists","warn");return;}
-  const id=currentUser.uid+"_"+email.replace(/[^a-z0-9]/g,"_");
-  await setDoc(doc(db,"staff",id),{name,email,designation:desig,shiftStart:shiftS,shiftEnd:shiftE,adminUid:currentUser.uid,createdAt:serverTimestamp()});
-  ["new-name","new-email","new-desig"].forEach(f=>$(f).value="");
-  showToast(`${name} added. They can now log in with ${email}.`,"success");
+
+  const btn=$("add-staff-btn"); btn.disabled=true; btn.textContent="Adding…";
+  try{
+    // Check duplicate within this society
+    const dupQ=query(collection(db,"societies",societyId,"staff"),where("email","==",email));
+    if(!(await getDocs(dupQ)).empty){showToast("Staff with this email already exists","warn");btn.disabled=false;btn.textContent="Add Staff Member";return;}
+
+    const tempPass=genPass();
+    const staffId =societyId+"_"+email.replace(/[^a-z0-9]/g,"_");
+
+    // Create Firebase Auth account for staff
+    const {initializeApp:initApp2}=await import("https://www.gstatic.com/firebasejs/10.12.2/firebase-app.js");
+    const {getAuth:getAuth2,createUserWithEmailAndPassword:createUser2,signOut:signOut2}=await import("https://www.gstatic.com/firebasejs/10.12.2/firebase-auth.js");
+    const app2=initApp2(firebaseConfig,"staff_creation_"+Date.now());
+    const auth2=getAuth2(app2);
+    const cred=await createUser2(auth2,email,tempPass);
+    const uid=cred.user.uid;
+    await signOut2(auth2);
+
+    // Write staff doc in society subcollection
+    await setDoc(doc(db,"societies",societyId,"staff",staffId),{
+      name,email,designation:desig,shiftStart:shiftS,shiftEnd:shiftE,
+      uid,societyId,disabled:false,mustChangePassword:true,
+      createdAt:serverTimestamp()
+    });
+    // Write role doc
+    await setDoc(doc(db,"userRoles",uid),{role:"staff",societyId,staffId,email,createdAt:serverTimestamp()});
+
+    const portalUrl=societyProfile.portalUrl||window.location.href;
+    // Send credentials email to staff member
+    await sendCredsEmail({
+      to_email:    email,
+      from_name:   societyProfile.name||"Society",
+      staff_name:  name,
+      staff_email: email,
+      temp_pass:   tempPass,
+      portal_url:  portalUrl,
+      message:     `Hello ${name},\n\nYour attendance portal account has been created.\n\nPortal Link: ${portalUrl}\nLogin Email: ${email}\nTemporary Password: ${tempPass}\n\nIMPORTANT: Log in and change your password on first use.\n\n— ${societyProfile.name}`
+    });
+
+    ["new-name","new-email","new-desig"].forEach(f=>$(f).value="");
+    showToast(`${name} added! Credentials sent to ${email}`,"success");
+    $("new-staff-creds").innerHTML=`
+      <div class="creds-box"><div class="creds-title">✅ Staff Added</div>
+      <div class="cred-row"><span>Login Email:</span><b>${email}</b></div>
+      <div class="cred-row"><span>Temp Password:</span><b class="mono">${tempPass}</b></div>
+      <div class="cred-note">⚠️ Share these credentials with ${name}. They must change password on first login.</div></div>`;
+  }catch(e){showToast("Failed: "+e.message,"error");console.error(e);}
+  finally{btn.disabled=false;btn.textContent="Add Staff Member";}
 };
 
 window.openEditStaff = (id,name,email,desig,shiftS,shiftE) => {
@@ -250,41 +636,47 @@ window.openEditStaff = (id,name,email,desig,shiftS,shiftE) => {
 };
 window.saveEdit = async () => {
   const id=$("edit-id").value;
-  await updateDoc(doc(db,"staff",id),{name:$("edit-name").value.trim(),designation:$("edit-desig").value.trim(),shiftStart:$("edit-shift-start").value,shiftEnd:$("edit-shift-end").value});
-  $("edit-modal").classList.add("hidden"); showToast("Staff details updated","success");
+  await updateDoc(doc(db,"societies",societyId,"staff",id),{
+    name:$("edit-name").value.trim(), designation:$("edit-desig").value.trim(),
+    shiftStart:$("edit-shift-start").value, shiftEnd:$("edit-shift-end").value
+  });
+  $("edit-modal").classList.add("hidden"); showToast("Staff updated","success");
 };
-window.closeEditModal = () => $("edit-modal").classList.add("hidden");
-window.delStaff = async (id,name) => {
-  if(!confirm(`Remove ${name} from the system?`)) return;
-  await deleteDoc(doc(db,"staff",id)); showToast(`${name} removed`,"info");
+window.closeEditModal = ()=>$("edit-modal").classList.add("hidden");
+
+window.toggleStaff = async (id,name,isDisabled) => {
+  if(!confirm(`${isDisabled?'Enable':'Disable'} ${name}?`)) return;
+  await updateDoc(doc(db,"societies",societyId,"staff",id),{disabled:!isDisabled});
+  showToast(`${name} ${isDisabled?'enabled':'disabled'}`,"info");
 };
 
-async function loadTodayAttendance(staffList) {
+// ── Society Attendance ──────────────────────────────────────────────────────
+async function loadSocietyAttendance(staffList) {
   const key=dayKey();
-  const q=query(collection(db,"attendance"),where("adminUid","==",currentUser.uid),where("date","==",key));
+  const q=query(collection(db,"societies",societyId,"attendance"),where("date","==",key));
   unsubLogs&&unsubLogs();
   unsubLogs=onSnapshot(q,
     async snap=>{
       const logMap={}; snap.docs.forEach(d=>{logMap[d.data().staffId]=d.data();});
       if(!staffList){
-        const sq=query(collection(db,"staff"),where("adminUid","==",currentUser.uid));
-        staffList=(await getDocs(sq)).docs.map(d=>({id:d.id,...d.data()}));
+        const sSnap=await getDocs(query(collection(db,"societies",societyId,"staff"),orderBy("name")));
+        staffList=sSnap.docs.map(d=>({id:d.id,...d.data()})).filter(s=>!s.disabled);
+      } else {
+        staffList=staffList.filter(s=>!s.disabled);
       }
       renderAttendanceTable(staffList,logMap);
       renderSummaryCards(staffList,logMap);
     },
     err=>{
-      console.error("Attendance error:",err);
       const tbody=$("attendance-tbody");
-      if(tbody) tbody.innerHTML='<tr><td colspan="6" class="empty-state" style="color:#E94F8A">⚠️ Permission denied — update Firestore rules. See ❓ Guide above.</td></tr>';
-      if(err.code==="permission-denied") showToast("⚠️ Firestore rules need updating — see Guide","warn");
+      if(tbody) tbody.innerHTML=`<tr><td colspan="6" class="empty-state" style="color:var(--accent2)">⚠️ ${err.message}</td></tr>`;
     }
   );
 }
 
 function renderAttendanceTable(staff,logMap) {
   const tbody=$("attendance-tbody");
-  if(!staff.length){tbody.innerHTML=`<tr><td colspan="6" class="empty-state">No staff yet</td></tr>`;return;}
+  if(!staff.length){tbody.innerHTML=`<tr><td colspan="6" class="empty-state">No active staff</td></tr>`;return;}
   tbody.innerHTML=staff.map(s=>{
     const log=logMap[s.id]||{};
     const entries=getEntries(log);
@@ -293,7 +685,7 @@ function renderAttendanceTable(staff,logMap) {
     const allDone=hasIn&&entries.every(e=>e.out);
     const status=!hasIn?"Absent":allDone?"Completed":"Checked In";
     const entryHtml=entries.length
-      ?entries.map((e,i)=>`<div style="font-size:11.5px;font-family:var(--mono);color:var(--muted);">${i+1}. ${fmt12(e.in)} → ${e.out?fmt12(e.out):`<b style="color:var(--teal)">now</b>`}</div>`).join("")
+      ?entries.map((e,i)=>`<div style="font-size:11.5px;font-family:var(--mono);color:var(--muted)">${i+1}. ${fmt12(e.in)} → ${e.out?fmt12(e.out):`<b style="color:var(--teal)">now</b>`}</div>`).join("")
       :`<span style="color:var(--muted)">—</span>`;
     return `<tr>
       <td><b>${s.name}</b>${late?`<span class="late-tag">Late</span>`:""}</td>
@@ -307,19 +699,18 @@ function renderAttendanceTable(staff,logMap) {
 }
 
 function renderSummaryCards(staff,logMap) {
-  $("card-total").textContent=staff.length;
+  $("card-total").textContent  =staff.length;
   $("card-present").textContent=staff.filter(s=>getEntries(logMap[s.id]||{}).length>0).length;
-  $("card-late").textContent=staff.filter(s=>{const l=logMap[s.id]||{};return getEntries(l).length>0&&isLate(l,s.shiftStart);}).length;
-  $("card-absent").textContent=staff.filter(s=>getEntries(logMap[s.id]||{}).length===0).length;
+  $("card-late").textContent   =staff.filter(s=>{const l=logMap[s.id]||{};return getEntries(l).length>0&&isLate(l,s.shiftStart);}).length;
+  $("card-absent").textContent =staff.filter(s=>getEntries(logMap[s.id]||{}).length===0).length;
 }
 
 window.exportTodayCSV = async () => {
-  const sq=query(collection(db,"staff"),where("adminUid","==",currentUser.uid));
-  const staff=(await getDocs(sq)).docs.map(d=>({id:d.id,...d.data()}));
+  const sSnap=await getDocs(query(collection(db,"societies",societyId,"staff"),orderBy("name")));
+  const staff=sSnap.docs.map(d=>({id:d.id,...d.data()})).filter(s=>!s.disabled);
   const key=dayKey();
-  const lq=query(collection(db,"attendance"),where("adminUid","==",currentUser.uid),where("date","==",key));
-  const lSnap=await getDocs(lq); const logMap={};
-  lSnap.docs.forEach(d=>{logMap[d.data().staffId]=d.data();});
+  const lSnap=await getDocs(query(collection(db,"societies",societyId,"attendance"),where("date","==",key)));
+  const logMap={}; lSnap.docs.forEach(d=>{logMap[d.data().staffId]=d.data();});
   const rows=[["Date","Name","Designation","Shift","Entries","Total Hours","Status","Late"]];
   staff.forEach(s=>{
     const log=logMap[s.id]||{};
@@ -327,33 +718,28 @@ window.exportTodayCSV = async () => {
     const status=!entries.length?"Absent":entries.every(e=>e.out)?"Completed":"Checked In";
     rows.push([key,s.name,s.designation||"",s.shiftStart,entryLines(log),fmtHours(log),status,entries.length&&isLate(log,s.shiftStart)?"Yes":"No"]);
   });
-  downloadCSV(rows,`attendance_${key}.csv`);
-  showToast("CSV exported","success");
+  downloadCSV(rows,`attendance_${key}.csv`); showToast("CSV exported","success");
 };
 
-// ── STAFF HISTORY (admin view) ────────────────────────────────────────────────
+// ── Staff History (Society views) ───────────────────────────────────────────
 let histId=null, histName=null;
-window.openStaffHistory = (id,name,desig) => {
+window.openStaffHistory=(id,name,desig)=>{
   histId=id; histName=name;
   $("hist-name").textContent=name; $("hist-desig").textContent=desig; $("hist-initials").textContent=initials(name);
-  const to=new Date(), from=new Date(); from.setDate(from.getDate()-6);
+  const to=new Date(),from=new Date(); from.setDate(from.getDate()-6);
   $("hist-from").value=dayKey(from); $("hist-to").value=dayKey(to);
-  $("hist-modal").classList.remove("hidden");
-  loadStaffHistory();
+  $("hist-modal").classList.remove("hidden"); loadStaffHistory();
 };
-window.closeHistModal = () => { $("hist-modal").classList.add("hidden"); histId=null; };
-window.loadStaffHistory = async () => {
+window.closeHistModal=()=>{$("hist-modal").classList.add("hidden");histId=null;};
+window.loadStaffHistory=async()=>{
   if(!histId) return;
-  const from=$("hist-from").value, to=$("hist-to").value;
-  if(!from||!to){showToast("Pick both dates","warn");return;}
-  if(from>to){showToast("From must be before To","warn");return;}
+  const from=$("hist-from").value,to=$("hist-to").value;
+  if(!from||!to||from>to){showToast("Check date range","warn");return;}
   const tbody=$("hist-tbody");
   tbody.innerHTML=`<tr><td colspan="4" class="empty-state">Loading…</td></tr>`;
   try{
-    const q=query(collection(db,"attendance"),where("staffId","==",histId));
-    const rows=(await getDocs(q)).docs.map(d=>d.data())
-      .filter(r=>r.adminUid===currentUser.uid&&r.date>=from&&r.date<=to)
-      .sort((a,b)=>b.date.localeCompare(a.date));
+    const q=query(collection(db,"societies",societyId,"attendance"),where("staffId","==",histId));
+    const rows=(await getDocs(q)).docs.map(d=>d.data()).filter(r=>r.date>=from&&r.date<=to).sort((a,b)=>b.date.localeCompare(a.date));
     if(!rows.length){tbody.innerHTML=`<tr><td colspan="4" class="empty-state">No records in this range</td></tr>`;return;}
     tbody.innerHTML=rows.map(r=>{
       const entries=getEntries(r);
@@ -363,72 +749,66 @@ window.loadStaffHistory = async () => {
     }).join("");
   }catch(e){tbody.innerHTML=`<tr><td colspan="4" class="empty-state">Error: ${e.message}</td></tr>`;}
 };
-window.exportStaffCSV = async () => {
-  const from=$("hist-from").value, to=$("hist-to").value;
+window.exportStaffCSV=async()=>{
+  const from=$("hist-from").value,to=$("hist-to").value;
   if(!from||!to||from>to){showToast("Check date range","warn");return;}
   try{
-    const q=query(collection(db,"attendance"),where("staffId","==",histId));
-    const docs=(await getDocs(q)).docs.map(d=>d.data())
-      .filter(r=>r.adminUid===currentUser.uid&&r.date>=from&&r.date<=to)
-      .sort((a,b)=>b.date.localeCompare(a.date));
-    if(!docs.length){showToast("No records to export","warn");return;}
+    const q=query(collection(db,"societies",societyId,"attendance"),where("staffId","==",histId));
+    const docs=(await getDocs(q)).docs.map(d=>d.data()).filter(r=>r.date>=from&&r.date<=to).sort((a,b)=>b.date.localeCompare(a.date));
+    if(!docs.length){showToast("No records","warn");return;}
     const rows=[["Date","Name","Entry#","Check In","Check Out","Hours","Status"]];
     docs.forEach(r=>{
       const entries=getEntries(r);
       if(!entries.length){rows.push([r.date,histName,"—","—","—","—","Absent"]);}
-      else entries.forEach((e,i)=>rows.push([r.date,histName,i+1,e.in?fmt12(e.in):"",e.out?fmt12(e.out):"",e.in&&e.out?getDuration(e.in,e.out):"",!e.out?"Checked In":"Completed"]));
+      else entries.forEach((e,i)=>rows.push([r.date,histName,i+1,e.in?fmt12(e.in):"",e.out?fmt12(e.out):"",e.in&&e.out?getDur(e.in,e.out):"",!e.out?"Checked In":"Completed"]));
     });
-    downloadCSV(rows,`${histName.replace(/\s+/g,"_")}_${from}_to_${to}.csv`);
-    showToast("CSV exported","success");
+    downloadCSV(rows,`${histName.replace(/\s+/g,"_")}_${from}_to_${to}.csv`); showToast("Exported","success");
   }catch(e){showToast("Export failed","error");}
 };
 
-// ── STAFF DASHBOARD ───────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// ══════════════════════════════════════════════════════════════════════════════
+//  STAFF PANEL
+// ══════════════════════════════════════════════════════════════════════════════
+// ─────────────────────────────────────────────────────────────────────────────
 async function loadStaffDashboard() {
   showSection("staff-section");
-  $("staff-welcome").textContent=staffProfile.name;
+  $("staff-welcome").textContent    = staffProfile.name;
   $("staff-initials-big").textContent=initials(staffProfile.name);
-  $("staff-role").textContent=staffProfile.designation||"";
-  $("staff-shift").textContent=`Shift: ${staffProfile.shiftStart} – ${staffProfile.shiftEnd}`;
-  $("staff-date").textContent=todayFull();
+  $("staff-role").textContent       = staffProfile.designation||"";
+  $("staff-shift").textContent      = `Shift: ${staffProfile.shiftStart} – ${staffProfile.shiftEnd}`;
+  $("staff-date").textContent       = todayFull();
+  $("staff-society-name").textContent= societyProfile?.name||"Your Society";
   startClock("staff-clock");
   listenStaffLog();
-  // fetch society name
-  if(staffProfile.adminUid){
-    const as=await getDoc(doc(db,"admins",staffProfile.adminUid));
-    $("staff-society-name").textContent=as.exists()?as.data().society:"Your Society";
-  }
   loadMyHistory();
 }
 
 function listenStaffLog() {
-  const ref=doc(db,"attendance",`${staffProfile.id}_${dayKey()}`);
+  const ref=doc(db,"societies",societyId,"attendance",`${staffProfile.id}_${dayKey()}`);
   onSnapshot(ref,snap=>updateStaffUI(snap.exists()?snap.data():{}));
 }
 
 function updateStaffUI(log) {
-  const entries=getEntries(log), last=lastEntry(log);
-  $("display-in").textContent  = entries.length?fmt12(entries[0].in):"—";
-  $("display-out").textContent = last&&last.out?fmt12(last.out):entries.length?"In progress":"—";
-  // show all today's pairs
+  const entries=getEntries(log),last=lastEntry(log);
+  $("display-in").textContent =entries.length?fmt12(entries[0].in):"—";
+  $("display-out").textContent=last&&last.out?fmt12(last.out):entries.length?"In progress":"—";
   const todayEl=$("today-entries");
   if(entries.length){
     todayEl.innerHTML=entries.map((e,i)=>`<div class="mono" style="font-size:12px;color:var(--muted)">${i+1}. ${fmt12(e.in)} → ${e.out?fmt12(e.out):`<b style="color:var(--teal)">now</b>`}</div>`).join("");
     todayEl.style.display="block";
-  } else {
-    todayEl.style.display="none";
-  }
-  $("btn-checkin").disabled  = !canCheckIn(log);
-  $("btn-checkout").disabled = !canCheckOut(log);
+  }else{todayEl.style.display="none";}
+  $("btn-checkin").disabled =!canCheckIn(log);
+  $("btn-checkout").disabled=!canCheckOut(log);
 }
 
 async function loadMyHistory() {
   const el=$("my-history-list"); if(!el) return;
   el.innerHTML=`<div class="empty-state">Loading…</div>`;
   try{
-    const q=query(collection(db,"attendance"),where("staffId","==",staffProfile.id));
+    const q=query(collection(db,"societies",societyId,"attendance"),where("staffId","==",staffProfile.id));
     const rows=(await getDocs(q)).docs.map(d=>d.data()).sort((a,b)=>b.date.localeCompare(a.date)).slice(0,30);
-    if(!rows.length){el.innerHTML=`<div class="empty-state">No attendance records yet</div>`;return;}
+    if(!rows.length){el.innerHTML=`<div class="empty-state">No records yet</div>`;return;}
     el.innerHTML=rows.map(r=>{
       const entries=getEntries(r);
       const status=!entries.length?"Absent":entries.every(e=>e.out)?"Completed":"Checked In";
@@ -438,210 +818,224 @@ async function loadMyHistory() {
   }catch(e){el.innerHTML=`<div class="empty-state">Couldn't load history</div>`;}
 }
 
-window.exportMyCSV = async () => {
+window.exportMyCSV=async()=>{
   try{
-    const q=query(collection(db,"attendance"),where("staffId","==",staffProfile.id));
+    const q=query(collection(db,"societies",societyId,"attendance"),where("staffId","==",staffProfile.id));
     const docs=(await getDocs(q)).docs.map(d=>d.data()).sort((a,b)=>b.date.localeCompare(a.date));
-    if(!docs.length){showToast("No records to export","warn");return;}
-    const adminSnap=staffProfile.adminUid?await getDoc(doc(db,"admins",staffProfile.adminUid)):null;
-    const society=adminSnap?.exists()?adminSnap.data().society:"";
+    if(!docs.length){showToast("No records","warn");return;}
     const rows=[["Date","Entry#","Check In","Check Out","Hours","Status","Society"]];
     docs.forEach(r=>{
       const entries=getEntries(r);
-      if(!entries.length){rows.push([r.date,"—","—","—","—","Absent",society]);}
-      else entries.forEach((e,i)=>rows.push([r.date,i+1,e.in?fmt12(e.in):"",e.out?fmt12(e.out):"",e.in&&e.out?getDuration(e.in,e.out):"",!e.out?"Checked In":"Completed",society]));
+      if(!entries.length){rows.push([r.date,"—","—","—","—","Absent",societyProfile?.name||""]);}
+      else entries.forEach((e,i)=>rows.push([r.date,i+1,e.in?fmt12(e.in):"",e.out?fmt12(e.out):"",e.in&&e.out?getDur(e.in,e.out):"",!e.out?"Checked In":"Completed",societyProfile?.name||""]));
     });
-    downloadCSV(rows,`my_attendance_${staffProfile.name.replace(/\s+/g,"_")}.csv`);
-    showToast("Your attendance exported","success");
+    downloadCSV(rows,`my_attendance_${staffProfile.name.replace(/\s+/g,"_")}.csv`); showToast("Exported","success");
   }catch(e){showToast("Export failed","error");}
 };
 
-// ── CONFIRM CHECK-IN / CHECK-OUT ──────────────────────────────────────────────
+// Check-in/out confirm flow
 let pendingAction=null;
-window.askCheckIn  = () => openConfirm("in");
-window.askCheckOut = () => openConfirm("out");
+window.askCheckIn =()=>openConfirm("in");
+window.askCheckOut=()=>openConfirm("out");
 function openConfirm(action) {
   pendingAction=action;
   $("confirm-title").textContent=action==="in"?"Confirm Entry":"Confirm Exit";
-  $("confirm-desc").textContent=action==="in"?"Marking your check-in time as:":"Marking your check-out time as:";
-  $("confirm-time").textContent=new Date().toLocaleTimeString("en-IN",{hour:"2-digit",minute:"2-digit",second:"2-digit"});
+  $("confirm-desc").textContent =action==="in"?"Marking your check-in time as:":"Marking your check-out time as:";
+  $("confirm-time").textContent =new Date().toLocaleTimeString("en-IN",{hour:"2-digit",minute:"2-digit",second:"2-digit"});
   const btn=$("confirm-btn");
   btn.textContent=action==="in"?"✅ Confirm Entry":"🏁 Confirm Exit";
   btn.className="btn "+(action==="in"?"btn-primary":"btn-danger");
   $("confirm-modal").classList.remove("hidden");
 }
-window.closeConfirm = () => { $("confirm-modal").classList.add("hidden"); pendingAction=null; };
-window.doConfirm = async () => {
+window.closeConfirm=()=>{$("confirm-modal").classList.add("hidden");pendingAction=null;};
+window.doConfirm=async()=>{
   if(!pendingAction) return;
   const action=pendingAction;
   const btn=$("confirm-btn"); btn.disabled=true; btn.textContent="Saving…";
   try{
-    if(action==="in") await doCheckIn();
-    else await doCheckOut();
-    // Close modal immediately after save — don't wait for email
-    btn.disabled=false;
-    window.closeConfirm();
-    loadMyHistory();
-    // Send email in background — never blocks the UI
-    notifyAdmin(action).catch(e=>console.error("notifyAdmin failed:",e));
+    if(action==="in") await doCheckIn(); else await doCheckOut();
+    btn.disabled=false; window.closeConfirm(); loadMyHistory();
+    notifyAdmin(action).catch(e=>console.error("notify failed:",e));
   }catch(e){
-    console.error("doConfirm error:",e);
     showToast("Save failed: "+e.message,"error");
-    btn.disabled=false;
-    btn.textContent=action==="in"?"✅ Confirm Entry":"🏁 Confirm Exit";
+    btn.disabled=false; btn.textContent=action==="in"?"✅ Confirm Entry":"🏁 Confirm Exit";
   }
 };
 
 async function doCheckIn() {
-  const key=dayKey(), now=new Date().toISOString(), logId=`${staffProfile.id}_${key}`;
-  await setDoc(doc(db,"attendance",logId),{
-    staffId:staffProfile.id, staffName:staffProfile.name, staffEmail:staffProfile.email,
-    date:key, adminUid:staffProfile.adminUid, entries:arrayUnion({in:now,out:null})
+  const key=dayKey(),now=new Date().toISOString(),logId=`${staffProfile.id}_${key}`;
+  await setDoc(doc(db,"societies",societyId,"attendance",logId),{
+    staffId:staffProfile.id,staffName:staffProfile.name,staffEmail:staffProfile.email,
+    date:key,societyId,entries:arrayUnion({in:now,out:null})
   },{merge:true});
   showToast("✅ Checked in at "+fmt12(now),"success");
 }
 async function doCheckOut() {
-  const key=dayKey(), now=new Date().toISOString(), logId=`${staffProfile.id}_${key}`;
-  const snap=await getDoc(doc(db,"attendance",logId));
-  if(!snap.exists()){showToast("No check-in found for today","warn");return;}
+  const key=dayKey(),now=new Date().toISOString(),logId=`${staffProfile.id}_${key}`;
+  const snap=await getDoc(doc(db,"societies",societyId,"attendance",logId));
+  if(!snap.exists()){showToast("No check-in found","warn");return;}
   const entries=[...(snap.data().entries||[])];
   const idx=entries.map(e=>e.out).lastIndexOf(null);
   if(idx===-1){showToast("No open entry to close","warn");return;}
   entries[idx]={...entries[idx],out:now};
-  await updateDoc(doc(db,"attendance",logId),{entries});
+  await updateDoc(doc(db,"societies",societyId,"attendance",logId),{entries});
   showToast("🏁 Checked out at "+fmt12(now),"info");
 }
 async function notifyAdmin(action) {
-  try{
-    const key=dayKey(), snap=await getDoc(doc(db,"attendance",`${staffProfile.id}_${key}`));
-    if(!snap.exists()) return;
-    const entries=snap.data().entries||[];
-    const time=action==="in"?fmt12(entries[entries.length-1]?.in):fmt12(entries[entries.length-1]?.out);
-    if(!staffProfile.adminUid) return;
-    const as=await getDoc(doc(db,"admins",staffProfile.adminUid));
-    if(!as.exists()) return;
-    await sendEmail({staffName:staffProfile.name,staffEmail:staffProfile.email,action,time,adminEmail:as.data().email,societyName:as.data().society});
-  }catch(e){console.error(e);}
+  const key=dayKey(),snap=await getDoc(doc(db,"societies",societyId,"attendance",`${staffProfile.id}_${key}`));
+  if(!snap.exists()) return;
+  const entries=snap.data().entries||[];
+  const time=action==="in"?fmt12(entries[entries.length-1]?.in):fmt12(entries[entries.length-1]?.out);
+  const sSnap=await getDoc(doc(db,"societies",societyId));
+  if(!sSnap.exists()) return;
+  const sData=sSnap.data();
+  const actionText=action==="in"?"Checked IN ✅":"Checked OUT 🏁";
+  await sendNotificationEmail({
+    to_email:    sData.email,
+    from_name:   sData.name||"Society",
+    staff_name:  staffProfile.name,
+    staff_email: staffProfile.email,
+    action:      actionText,
+    time,
+    date:        new Date().toLocaleDateString("en-IN"),
+    message:     `${staffProfile.name} (${staffProfile.email}) has ${actionText} at ${time} on ${new Date().toLocaleDateString("en-IN")}.\n\n— Sent automatically by ${sData.name}`
+  });
 }
 
-// ── CSV helper ────────────────────────────────────────────────────────────────
-function downloadCSV(rows,filename) {
-  const csv=rows.map(r=>r.map(v=>`"${v}"`).join(",")).join("\n");
-  const a=document.createElement("a");
-  a.href="data:text/csv;charset=utf-8,"+encodeURIComponent(csv);
-  a.download=filename; a.click();
-}
+// Guide toggle
+window.openGuide =()=>$("guide-modal").classList.remove("hidden");
+window.closeGuide=()=>$("guide-modal").classList.add("hidden");
 </script>
+
 <style>
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0;}
 :root{
-  --bg:#EEE9FB;
-  --surface:#FFFFFF;
-  --card:#FFFFFF;
-  --accent:#6D28D9;
-  --accent-g:linear-gradient(90deg,#7C3AED,#6D28D9);
-  --accent2:#E94F8A;
-  --teal:#0D9488;
-  --amber:#D97706;
-  --text:#1F1B33;
-  --muted:#6B6480;
-  --border:#E4DEF7;
-  --radius:14px;
+  --bg:#EEE9FB; --surface:#FFFFFF; --card:#FFFFFF;
+  --accent:#6D28D9; --accent-g:linear-gradient(90deg,#7C3AED,#6D28D9);
+  --accent2:#E94F8A; --teal:#0D9488; --amber:#D97706;
+  --text:#1F1B33; --muted:#6B6480; --border:#E4DEF7;
+  --company:#1E1B4B; --radius:14px;
   --mono:'JetBrains Mono','SF Mono',Consolas,monospace;
 }
 body{background:linear-gradient(180deg,#E8E1F9 0%,#F0ECF8 60%,#EAE5F7 100%);color:var(--text);font-family:'Inter',system-ui,sans-serif;min-height:100vh;}
 .hidden{display:none!important;}
 a{color:var(--accent);text-decoration:none;font-weight:600;}
+.mono{font-family:var(--mono);}
 
-/* ── toast ── */
-.toast{position:fixed;bottom:24px;left:50%;transform:translateX(-50%) translateY(20px);background:var(--card);border:1px solid var(--border);color:var(--text);padding:12px 20px;border-radius:40px;font-size:13.5px;font-weight:600;opacity:0;transition:.3s;z-index:9999;white-space:nowrap;box-shadow:0 8px 32px rgba(109,40,217,.18);}
+/* Toast */
+.toast{position:fixed;bottom:24px;left:50%;transform:translateX(-50%) translateY(20px);background:var(--card);border:1px solid var(--border);color:var(--text);padding:12px 22px;border-radius:40px;font-size:13.5px;font-weight:600;opacity:0;transition:.3s;z-index:9999;white-space:nowrap;box-shadow:0 8px 32px rgba(109,40,217,.18);}
 .toast.show{opacity:1;transform:translateX(-50%) translateY(0);}
-.toast-success{border-color:var(--teal);}
-.toast-error{border-color:var(--accent2);}
-.toast-warn{border-color:var(--amber);}
+.toast-success{border-color:var(--teal);} .toast-error{border-color:var(--accent2);} .toast-warn{border-color:var(--amber);}
 
-/* ── topnav ── */
+/* Topnav */
 .topnav{background:var(--surface);border-bottom:1px solid var(--border);position:sticky;top:0;z-index:10;}
-.topnav-inner{max-width:980px;margin:0 auto;padding:14px 20px;display:flex;justify-content:space-between;align-items:center;}
+.topnav-inner{max-width:1100px;margin:0 auto;padding:13px 20px;display:flex;justify-content:space-between;align-items:center;}
 .logo{display:flex;align-items:center;gap:10px;}
 .logo-mark{width:36px;height:36px;border-radius:10px;background:var(--accent-g);display:flex;align-items:center;justify-content:center;font-size:18px;}
-.logo-text{font-weight:800;font-size:16px;}
-.logo-sub{font-size:11px;color:var(--muted);}
+.logo-text{font-weight:800;font-size:15px;} .logo-sub{font-size:11px;color:var(--muted);}
+.company-logo-mark{background:linear-gradient(135deg,#1E1B4B,#4338CA);}
 .nav-right{display:flex;align-items:center;gap:8px;}
 .nav-clock{font-family:var(--mono);font-size:13px;color:var(--accent);}
-.btn-guide{background:var(--accent-g);color:#fff;border:none;border-radius:8px;padding:7px 13px;font-size:13px;font-weight:700;cursor:pointer;box-shadow:0 4px 12px rgba(109,40,217,.25);}
-.btn-guide:hover{filter:brightness(1.1);}
-.btn-signout{background:transparent;border:1px solid var(--border);border-radius:8px;padding:7px 12px;color:var(--muted);font-size:13px;cursor:pointer;transition:.2s;}
+.btn-guide{background:var(--accent-g);color:#fff;border:none;border-radius:8px;padding:7px 13px;font-size:13px;font-weight:700;cursor:pointer;}
+.btn-signout{background:transparent;border:1px solid var(--border);border-radius:8px;padding:7px 12px;color:var(--muted);font-size:13px;cursor:pointer;}
 .btn-signout:hover{border-color:var(--accent2);color:var(--accent2);}
+.company-badge{background:linear-gradient(90deg,#1E1B4B,#4338CA);color:#fff;font-size:11px;font-weight:700;padding:3px 10px;border-radius:20px;letter-spacing:.04em;}
 
-/* ── auth page ── */
+/* Auth */
 #auth-section{display:flex;flex-direction:column;align-items:center;justify-content:center;min-height:100vh;padding:24px;}
 .auth-hero{text-align:center;margin-bottom:28px;}
 .auth-pill{display:inline-flex;align-items:center;gap:10px;background:linear-gradient(90deg,#7C3AED,#0D9488);padding:10px 22px;border-radius:999px;box-shadow:0 10px 26px rgba(109,40,217,.25);margin-bottom:20px;}
 .auth-pill span{color:#fff;font-weight:800;font-size:13px;letter-spacing:.06em;}
 .auth-headline{font-size:30px;font-weight:800;line-height:1.15;background:linear-gradient(90deg,#6D28D9,#E94F8A);-webkit-background-clip:text;background-clip:text;color:transparent;margin-bottom:10px;}
-.auth-sub-text{color:var(--muted);font-size:13.5px;max-width:320px;margin:0 auto 18px;}
-.auth-chips{display:flex;flex-wrap:wrap;justify-content:center;gap:8px;margin-bottom:0;}
-.chip{font-weight:700;font-size:12.5px;padding:7px 14px;border-radius:999px;}
-.chip-purple{background:#EDE9FE;color:#6D28D9;}
-.chip-teal{background:#CCFBF1;color:#0D9488;}
-.chip-pink{background:#FCE7F3;color:#BE185D;}
-.chip-amber{background:#FEF3C7;color:#B45309;}
-
+.auth-sub-text{color:var(--muted);font-size:13.5px;max-width:340px;margin:0 auto 18px;}
+.auth-chips{display:flex;flex-wrap:wrap;justify-content:center;gap:8px;}
+.chip{font-weight:700;font-size:12px;padding:6px 13px;border-radius:999px;}
+.chip-purple{background:#EDE9FE;color:#6D28D9;} .chip-teal{background:#CCFBF1;color:#0D9488;} .chip-pink{background:#FCE7F3;color:#BE185D;} .chip-amber{background:#FEF3C7;color:#B45309;}
 .auth-card{background:var(--surface);border:1px solid var(--border);border-radius:24px;padding:36px 32px;width:100%;max-width:420px;box-shadow:0 20px 50px rgba(109,40,217,.12);}
-.tab-bar{display:flex;gap:4px;margin-bottom:24px;background:var(--bg);border-radius:10px;padding:4px;}
-.tab-btn{flex:1;border:none;background:transparent;color:var(--muted);padding:9px;border-radius:8px;font-size:13px;font-weight:600;cursor:pointer;transition:.2s;}
-.tab-btn.active{background:var(--card);color:var(--text);}
-.auth-panel{display:flex;flex-direction:column;gap:12px;}
-.divider{text-align:center;color:var(--muted);font-size:12px;margin:4px 0;}
-.register-note{background:rgba(109,40,217,.06);border:1px solid rgba(109,40,217,.18);border-radius:10px;padding:12px 14px;font-size:13px;color:var(--muted);}
+.auth-card-title{font-size:20px;font-weight:800;margin-bottom:4px;}
+.auth-card-sub{font-size:13px;color:var(--muted);margin-bottom:24px;}
 
-/* ── form controls ── */
-.fgroup{display:flex;flex-direction:column;gap:5px;}
+/* Change password screen */
+#change-password-section{display:flex;align-items:center;justify-content:center;min-height:100vh;padding:20px;}
+.change-pass-card{background:var(--surface);border:1px solid var(--border);border-radius:24px;padding:36px 32px;width:100%;max-width:400px;box-shadow:0 20px 50px rgba(109,40,217,.12);text-align:center;}
+.change-pass-icon{font-size:40px;margin-bottom:14px;}
+
+/* Form controls */
+.fgroup{display:flex;flex-direction:column;gap:5px;margin-bottom:12px;}
 .fgroup label{font-size:12px;color:var(--muted);font-weight:600;text-transform:uppercase;letter-spacing:.04em;}
-input,select{background:var(--bg);border:1px solid var(--border);border-radius:9px;padding:11px 14px;color:var(--text);font-size:14px;font-family:inherit;transition:.2s;outline:none;width:100%;}
+input,select,textarea{background:var(--bg);border:1px solid var(--border);border-radius:9px;padding:11px 14px;color:var(--text);font-size:14px;font-family:inherit;transition:.2s;outline:none;width:100%;}
 input:focus,select:focus{border-color:var(--accent);box-shadow:0 0 0 3px rgba(109,40,217,.12);}
 input[type="time"],input[type="date"]{font-family:var(--mono);}
+input:disabled{opacity:.5;}
 
-/* ── buttons ── */
+/* Buttons */
 .btn{border:none;border-radius:10px;padding:12px 18px;font-size:14px;font-weight:700;cursor:pointer;display:flex;align-items:center;justify-content:center;gap:7px;transition:.2s;width:100%;}
-.btn-primary{background:var(--accent-g);color:#fff;box-shadow:0 8px 20px rgba(109,40,217,.28);}
+.btn-primary{background:var(--accent-g);color:#fff;box-shadow:0 8px 20px rgba(109,40,217,.25);}
 .btn-primary:hover{filter:brightness(1.08);}
 .btn-secondary{background:var(--card);color:var(--text);border:1px solid var(--border);}
 .btn-secondary:hover{border-color:var(--accent);}
-.btn-danger{background:rgba(233,79,138,.12);color:var(--accent2);border:1px solid var(--accent2);}
-.btn-google{background:#fff;color:#1F1B33;border:1px solid #E0E0E0;}
+.btn-danger{background:rgba(233,79,138,.1);color:var(--accent2);border:1px solid var(--accent2);}
+.btn-company{background:linear-gradient(90deg,#1E1B4B,#4338CA);color:#fff;}
 .btn:disabled{opacity:.4;cursor:not-allowed;}
-.icon-btn{background:var(--card);border:1px solid var(--border);border-radius:8px;padding:7px 10px;cursor:pointer;font-size:15px;}
+.icon-btn{background:var(--card);border:1px solid var(--border);border-radius:8px;padding:7px 10px;cursor:pointer;font-size:14px;}
 .edit-btn{background:rgba(13,148,136,.1);border-color:var(--teal);}
 .del-btn{background:rgba(233,79,138,.1);border-color:var(--accent2);}
 
-/* ── inner wrap ── */
-.inner-wrap{max-width:980px;margin:0 auto;padding:28px 20px;}
+/* Inner wrap */
+.inner-wrap{max-width:1100px;margin:0 auto;padding:28px 20px;}
 .page-title{font-size:22px;font-weight:800;margin-bottom:4px;}
-.page-sub{font-size:13px;color:var(--muted);margin-bottom:24px;}
+.page-sub{font-size:13px;color:var(--muted);margin-bottom:22px;}
+.sec-title{font-size:15px;font-weight:700;margin-bottom:14px;}
+.row-between{display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;flex-wrap:wrap;gap:10px;}
 
-/* ── admin tabs ── */
-.tab-row{display:flex;gap:6px;margin-bottom:24px;}
-.adm-tab-btn{border:1px solid var(--border);background:var(--surface);color:var(--muted);border-radius:9px;padding:9px 18px;font-size:13px;font-weight:600;cursor:pointer;transition:.2s;}
-.adm-tab-btn.active{background:var(--accent-g);color:#fff;border-color:transparent;box-shadow:0 6px 16px rgba(109,40,217,.25);}
+/* Company tabs */
+.tab-row{display:flex;gap:6px;margin-bottom:24px;flex-wrap:wrap;}
+.co-tab-btn,.soc-tab-btn,.adm-tab-btn{border:1px solid var(--border);background:var(--surface);color:var(--muted);border-radius:9px;padding:9px 18px;font-size:13px;font-weight:600;cursor:pointer;transition:.2s;}
+.co-tab-btn.active{background:linear-gradient(90deg,#1E1B4B,#4338CA);color:#fff;border-color:transparent;}
+.soc-tab-btn.active,.adm-tab-btn.active{background:var(--accent-g);color:#fff;border-color:transparent;box-shadow:0 4px 14px rgba(109,40,217,.22);}
 
-/* ── summary cards ── */
+/* Society cards (company view) */
+.soc-card{background:var(--card);border:1px solid var(--border);border-radius:var(--radius);padding:16px;display:flex;align-items:center;justify-content:space-between;gap:14px;margin-bottom:10px;box-shadow:0 3px 12px rgba(31,27,51,.04);}
+.soc-card-left{display:flex;align-items:center;gap:12px;}
+.soc-disabled{opacity:.55;}
+.badge-disabled{font-size:10px;font-weight:700;background:rgba(233,79,138,.12);color:var(--accent2);padding:2px 7px;border-radius:5px;margin-left:6px;}
+
+/* Staff cards */
+.staff-card{background:var(--card);border:1px solid var(--border);border-radius:var(--radius);padding:16px;display:flex;align-items:center;gap:14px;margin-bottom:10px;box-shadow:0 3px 12px rgba(31,27,51,.04);}
+.staff-disabled{opacity:.55;}
+.staff-clickable{cursor:pointer;transition:transform .15s,box-shadow .15s;}
+.staff-clickable:hover{transform:translateY(-2px);box-shadow:0 10px 26px rgba(109,40,217,.12);border-color:#D8CCF7;}
+.savatar{width:44px;height:44px;border-radius:50%;background:var(--accent-g);display:flex;align-items:center;justify-content:center;font-weight:800;font-size:15px;color:#fff;flex-shrink:0;}
+.staff-info{flex:1;} .staff-name{font-weight:700;font-size:15px;} .staff-meta{font-size:12px;color:var(--muted);margin-top:2px;}
+.staff-actions{display:flex;gap:8px;}
+.add-form{background:var(--card);border:1px solid var(--border);border-radius:var(--radius);padding:22px;margin-bottom:22px;box-shadow:0 3px 12px rgba(31,27,51,.04);}
+.add-form h3{font-size:15px;margin-bottom:16px;}
+.form-row{display:grid;grid-template-columns:1fr 1fr;gap:12px;}
+@media(max-width:600px){.form-row{grid-template-columns:1fr;}}
+
+/* Credentials display */
+.creds-box{background:linear-gradient(135deg,#F0FDF4,#DCFCE7);border:1px solid #86EFAC;border-radius:12px;padding:16px 18px;margin-top:14px;}
+.creds-title{font-weight:800;font-size:14px;color:#166534;margin-bottom:10px;}
+.cred-row{display:flex;gap:8px;font-size:13px;margin-bottom:6px;align-items:center;}
+.cred-row span{color:#6B7280;min-width:120px;}
+.cred-note{font-size:12px;color:#D97706;margin-top:8px;background:rgba(217,119,6,.08);padding:8px 10px;border-radius:8px;}
+
+/* Summary cards */
 .summary-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;margin-bottom:22px;}
 .sum-card{background:var(--card);border:1px solid var(--border);border-radius:var(--radius);padding:16px 18px;box-shadow:0 4px 16px rgba(31,27,51,.05);}
 .sum-label{font-size:11px;font-weight:700;color:var(--muted);text-transform:uppercase;letter-spacing:.05em;margin-bottom:8px;}
 .sum-value{font-family:var(--mono);font-size:32px;font-weight:700;}
-.val-green{color:var(--teal);}
-.val-amber{color:var(--amber);}
-.val-red{color:var(--accent2);}
+.val-green{color:var(--teal);} .val-amber{color:var(--amber);} .val-red{color:var(--accent2);}
 
-/* ── table ── */
+/* Table */
 .tbl-wrap{background:var(--card);border:1px solid var(--border);border-radius:var(--radius);overflow:auto;box-shadow:0 4px 20px rgba(31,27,51,.05);}
 table{width:100%;border-collapse:collapse;font-size:13.5px;}
 th{text-align:left;padding:12px 16px;font-size:11px;font-weight:700;color:var(--muted);text-transform:uppercase;letter-spacing:.04em;border-bottom:1px solid var(--border);white-space:nowrap;}
 td{padding:13px 16px;border-bottom:1px solid var(--border);vertical-align:middle;}
 tr:last-child td{border-bottom:none;}
-.mono{font-family:var(--mono);}
+.co-table{width:100%;border-collapse:collapse;font-size:13px;}
+.co-table th,.co-table td{padding:10px 14px;text-align:left;border-bottom:1px solid var(--border);}
+.co-table th{font-size:11px;font-weight:700;color:var(--muted);text-transform:uppercase;background:var(--bg);}
 .late-tag{margin-left:7px;font-size:10px;font-weight:700;background:rgba(217,119,6,.15);color:var(--amber);padding:2px 7px;border-radius:5px;}
 .sbadge{font-size:11.5px;font-weight:600;padding:4px 10px;border-radius:6px;}
 .sbadge-absent{background:rgba(233,79,138,.1);color:var(--accent2);}
@@ -649,23 +1043,7 @@ tr:last-child td{border-bottom:none;}
 .sbadge-completed{background:rgba(13,148,136,.12);color:var(--teal);}
 .empty-state{padding:36px;text-align:center;color:var(--muted);font-size:14px;}
 
-/* ── staff manage cards ── */
-.staff-card{background:var(--card);border:1px solid var(--border);border-radius:var(--radius);padding:16px;display:flex;align-items:center;gap:14px;margin-bottom:10px;box-shadow:0 3px 12px rgba(31,27,51,.04);}
-.staff-clickable{cursor:pointer;transition:transform .15s,box-shadow .15s;}
-.staff-clickable:hover{transform:translateY(-2px);box-shadow:0 10px 26px rgba(109,40,217,.12);border-color:#D8CCF7;}
-.savatar{width:44px;height:44px;border-radius:50%;background:var(--accent-g);display:flex;align-items:center;justify-content:center;font-weight:800;font-size:15px;color:#fff;flex-shrink:0;}
-.staff-info{flex:1;}
-.staff-name{font-weight:700;font-size:15px;}
-.staff-meta{font-size:12px;color:var(--muted);margin-top:2px;}
-.staff-actions{display:flex;gap:8px;}
-.add-form{background:var(--card);border:1px solid var(--border);border-radius:var(--radius);padding:22px;margin-bottom:22px;box-shadow:0 3px 12px rgba(31,27,51,.04);}
-.add-form h3{font-size:15px;margin-bottom:16px;}
-.form-row{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:12px;}
-@media(max-width:600px){.form-row{grid-template-columns:1fr;}}
-.row-between{display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;flex-wrap:wrap;gap:10px;}
-.sec-title{font-size:15px;font-weight:700;margin-bottom:14px;}
-
-/* ── staff dashboard ── */
+/* Staff dashboard */
 .staff-hero{background:var(--card);border:1px solid var(--border);border-radius:var(--radius);padding:28px;text-align:center;margin-bottom:22px;box-shadow:0 4px 20px rgba(109,40,217,.08);}
 .big-avatar{width:70px;height:70px;border-radius:50%;background:var(--accent-g);display:flex;align-items:center;justify-content:center;font-weight:800;font-size:26px;color:#fff;margin:0 auto 14px;}
 .big-clock{font-family:var(--mono);font-size:40px;font-weight:700;color:var(--accent);margin:10px 0;}
@@ -676,118 +1054,175 @@ tr:last-child td{border-bottom:none;}
 .action-row{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:14px;}
 .today-entries{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:12px 14px;margin-bottom:14px;}
 .info-box{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:14px 16px;font-size:13px;color:var(--muted);margin-bottom:22px;}
-.hist-row{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:12px 14px;display:flex;align-items:flex-start;gap:12px;margin-bottom:8px;box-shadow:0 2px 10px rgba(31,27,51,.03);}
+.hist-row{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:12px 14px;display:flex;align-items:flex-start;gap:12px;margin-bottom:8px;}
 .hist-date{font-weight:700;font-size:13px;margin-bottom:3px;}
 @media(max-width:480px){.action-row,.time-grid{grid-template-columns:1fr;}}
 
-/* ── modals ── */
+/* Modals */
 .modal-overlay{position:fixed;inset:0;background:rgba(31,27,51,.52);display:flex;align-items:center;justify-content:center;padding:20px;z-index:200;}
 .modal-box{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:28px;width:100%;max-width:440px;box-shadow:0 24px 60px rgba(31,27,51,.18);}
-.modal-title{font-size:17px;font-weight:800;margin-bottom:20px;}
+.modal-title{font-size:17px;font-weight:800;margin-bottom:16px;}
 .modal-actions{display:flex;gap:10px;margin-top:20px;}
 .hist-modal-box{max-width:620px;}
 .hist-range-row{display:grid;grid-template-columns:1fr 1fr auto auto;gap:10px;align-items:end;margin-bottom:16px;}
+.co-view-modal-box{max-width:720px;}
 @media(max-width:560px){.hist-range-row{grid-template-columns:1fr 1fr;}}
 
-/* ── guide modal ── */
-.guide-modal-box{max-width:660px;max-height:88vh;overflow-y:auto;padding:0;position:relative;}
-.guide-header{background:linear-gradient(120deg,#7C3AED,#E94F8A);padding:26px 28px 20px;border-radius:var(--radius) var(--radius) 0 0;color:#fff;position:sticky;top:0;z-index:1;}
-.guide-header h2{font-size:20px;font-weight:800;margin-bottom:4px;}
-.guide-header p{font-size:13px;opacity:.85;}
-.guide-close-btn{position:absolute;top:16px;right:18px;background:rgba(255,255,255,.2);border:none;color:#fff;border-radius:50%;width:30px;height:30px;font-size:16px;cursor:pointer;display:flex;align-items:center;justify-content:center;}
-.guide-body{padding:24px 28px 28px;}
-.g-section{margin-bottom:28px;}
-.g-section:last-child{margin-bottom:0;}
-.g-section-title{font-size:12.5px;font-weight:800;text-transform:uppercase;letter-spacing:.06em;color:var(--accent);margin-bottom:12px;padding-bottom:6px;border-bottom:2px solid var(--border);}
-.g-item{display:flex;gap:12px;margin-bottom:12px;align-items:flex-start;}
-.g-icon{width:34px;height:34px;border-radius:9px;flex-shrink:0;display:flex;align-items:center;justify-content:center;font-size:16px;}
-.gi-purple{background:#EDE9FE;} .gi-teal{background:#CCFBF1;} .gi-pink{background:#FCE7F3;} .gi-amber{background:#FEF3C7;} .gi-green{background:#DCFCE7;} .gi-blue{background:#DBEAFE;}
-.g-item-title{font-weight:700;font-size:14px;margin-bottom:3px;}
-.g-item-desc{font-size:13px;color:var(--muted);line-height:1.55;}
-.g-badge{display:inline-block;font-size:11px;font-weight:700;padding:2px 8px;border-radius:5px;margin-left:5px;}
-.gb-admin{background:#EDE9FE;color:#6D28D9;} .gb-staff{background:#CCFBF1;color:#0D9488;} .gb-both{background:#FEF3C7;color:#B45309;}
-.g-role-card{border-radius:12px;padding:16px;margin-bottom:12px;border:1px solid var(--border);}
-.g-admin-card{background:#F5F3FF;border-color:#DDD6FE;}
-.g-staff-card{background:#F0FDFA;border-color:#99F6E4;}
-.g-role-title{font-weight:800;font-size:14px;margin-bottom:10px;}
-.g-step{display:flex;gap:10px;align-items:flex-start;margin-bottom:9px;}
-.g-step-num{width:22px;height:22px;border-radius:50%;background:var(--accent);color:#fff;font-size:11px;font-weight:800;display:flex;align-items:center;justify-content:center;flex-shrink:0;margin-top:1px;}
-.g-step-num-t{background:var(--teal);}
-.g-step-text{font-size:13px;color:var(--muted);line-height:1.5;}
-.g-email-box{background:var(--bg);border:1px solid var(--border);border-radius:10px;padding:14px 16px;margin-bottom:10px;}
-.g-email-type{font-weight:700;font-size:13px;margin-bottom:5px;}
-.g-email-desc{font-size:12.5px;color:var(--muted);line-height:1.5;}
+/* Guide */
+.guide-modal-box{max-width:640px;max-height:88vh;overflow-y:auto;padding:0;position:relative;}
+.guide-header{background:var(--accent-g);padding:24px 28px 18px;border-radius:var(--radius) var(--radius) 0 0;color:#fff;position:sticky;top:0;z-index:1;}
+.guide-header h2{font-size:19px;font-weight:800;margin-bottom:3px;}
+.guide-close-btn{position:absolute;top:14px;right:16px;background:rgba(255,255,255,.2);border:none;color:#fff;border-radius:50%;width:28px;height:28px;font-size:15px;cursor:pointer;display:flex;align-items:center;justify-content:center;}
+.guide-body{padding:22px 26px 26px;}
+.g-section{margin-bottom:24px;} .g-section:last-child{margin-bottom:0;}
+.g-section-title{font-size:12px;font-weight:800;text-transform:uppercase;letter-spacing:.06em;color:var(--accent);margin-bottom:10px;padding-bottom:5px;border-bottom:2px solid var(--border);}
+.g-item{display:flex;gap:10px;margin-bottom:10px;align-items:flex-start;}
+.g-icon{width:32px;height:32px;border-radius:8px;flex-shrink:0;display:flex;align-items:center;justify-content:center;font-size:15px;}
+.gi-purple{background:#EDE9FE;} .gi-teal{background:#CCFBF1;} .gi-pink{background:#FCE7F3;} .gi-amber{background:#FEF3C7;} .gi-green{background:#DCFCE7;} .gi-indigo{background:#E0E7FF;}
+.g-item-title{font-weight:700;font-size:13.5px;margin-bottom:2px;}
+.g-item-desc{font-size:12.5px;color:var(--muted);line-height:1.5;}
+.rules-box{background:#1F1B33;color:#A5F3FC;border-radius:8px;padding:14px;font-family:var(--mono);font-size:11px;line-height:1.7;white-space:pre-wrap;user-select:all;margin-top:8px;}
 </style>
 </head>
 <body>
 
-<!-- ══════════════════ AUTH SCREEN ══════════════════ -->
+<!-- ══ LOGIN SCREEN ══════════════════════════════════════════════════════════ -->
 <div id="auth-section" class="page-section">
   <div class="auth-hero">
-    <div class="auth-pill"><span>🏢</span><span>SOCIETY ATTENDANCE PORTAL</span></div>
-    <div class="auth-headline">Track Every<br/>Check-In, Instantly</div>
-    <div class="auth-sub-text">Digital attendance for housing societies — simple, transparent, real-time.</div>
-    <div class="auth-chips">
-      <span class="chip chip-purple">⏱️ Live Clock-In</span>
-      <span class="chip chip-teal">📊 Daily Records</span>
-      <span class="chip chip-pink">📁 Excel Export</span>
-      <span class="chip chip-amber">🔒 Secure Login</span>
+    <div class="auth-pill"><span>🏢</span><span>SOLUTIONS4SOCIETY</span></div>
+    <div class="auth-headline">Society Attendance<br/>Management Platform</div>
+    <div class="auth-sub-text">Secure, multi-society attendance tracking for housing societies.</div>
+    <div class="auth-chips" style="margin-top:14px">
+      <span class="chip chip-purple">🏢 Company Panel</span>
+      <span class="chip chip-teal">🏘️ Society Panel</span>
+      <span class="chip chip-pink">👤 Staff Portal</span>
+      <span class="chip chip-amber">🔒 Role-Based Access</span>
     </div>
   </div>
-
   <div class="auth-card">
-    <div class="tab-bar">
-      <button class="tab-btn active" data-tab="login" onclick="showTab('login')">Sign In</button>
-      <button class="tab-btn" data-tab="register" onclick="showTab('register')">Register Admin</button>
-    </div>
-
-    <div id="tab-login" class="auth-panel">
-      <button class="btn btn-google" onclick="googleSignIn()">
-        <svg width="18" height="18" viewBox="0 0 18 18"><path fill="#4285F4" d="M16.51 8H8.98v3h4.3c-.18 1-.74 1.48-1.6 2.04v2.01h2.6a7.8 7.8 0 0 0 2.38-5.88c0-.57-.05-.66-.15-1.18"/><path fill="#34A853" d="M8.98 17c2.16 0 3.97-.72 5.3-1.94l-2.6-2.01c-.72.48-1.63.76-2.7.76-2.08 0-3.84-1.4-4.47-3.29H1.87v2.08A8 8 0 0 0 8.98 17"/><path fill="#FBBC05" d="M4.51 10.52A4.8 4.8 0 0 1 4.26 9c0-.52.09-1.03.25-1.52V5.4H1.87A8 8 0 0 0 .98 9c0 1.29.31 2.51.89 3.6z"/><path fill="#EA4335" d="M8.98 3.58c1.17 0 2.23.4 3.06 1.2l2.3-2.3A8 8 0 0 0 8.98 1a8 8 0 0 0-7.11 4.39l2.64 2.05c.63-1.89 2.39-3.29 4.47-3.29"/></svg>
-        Sign in with Google (Admin / Staff)
-      </button>
-      <div class="divider">— or admin email / password —</div>
-      <div class="fgroup"><label>Email</label><input id="login-email" type="email" placeholder="admin@society.com"/></div>
-      <div class="fgroup"><label>Password</label><input id="login-pass" type="password" placeholder="••••••••"/></div>
-      <button class="btn btn-primary" onclick="adminLogin()">Sign In →</button>
-      <div style="text-align:center;font-size:12px;"><a href="#" onclick="forgotPassword()">Forgot password?</a></div>
-    </div>
-
-    <div id="tab-register" class="auth-panel hidden">
-      <div class="register-note">🔒 This creates a <b>Society Admin</b> account. Staff members do <b>not</b> register here — admin adds them from the dashboard.</div>
-      <div class="fgroup"><label>Society Name</label><input id="reg-society" type="text" placeholder="e.g. Greenview Residency"/></div>
-      <div class="fgroup"><label>Admin Email</label><input id="reg-email" type="email" placeholder="admin@society.com"/></div>
-      <div class="fgroup"><label>Password (min 6 chars)</label><input id="reg-pass" type="password" placeholder="••••••••"/></div>
-      <button class="btn btn-primary" onclick="adminRegister()">Create Admin Account</button>
-    </div>
+    <div class="auth-card-title">Sign In</div>
+    <div class="auth-card-sub">Access your dashboard — company, society, or staff.</div>
+    <div class="fgroup"><label>Email</label><input id="login-email" type="email" placeholder="your@email.com"/></div>
+    <div class="fgroup"><label>Password</label><input id="login-pass" type="password" placeholder="••••••••" onkeydown="if(event.key==='Enter')doLogin()"/></div>
+    <button id="login-btn" class="btn btn-primary" onclick="doLogin()" style="margin-top:4px">Sign In →</button>
+    <div style="text-align:center;font-size:12px;margin-top:10px"><a href="#" onclick="doForgotPassword()">Forgot password?</a></div>
   </div>
 </div>
 
-<!-- ══════════════════ ADMIN DASHBOARD ══════════════════ -->
-<div id="admin-section" class="page-section hidden">
+<!-- ══ FORCE PASSWORD CHANGE ═════════════════════════════════════════════════ -->
+<div id="change-password-section" class="page-section hidden">
+  <div class="change-pass-card">
+    <div class="change-pass-icon">🔐</div>
+    <h2 id="change-pass-title" style="font-size:20px;font-weight:800;margin-bottom:6px">Set New Password</h2>
+    <p id="change-pass-subtitle" style="font-size:13px;color:var(--muted);margin-bottom:24px">Please set a secure password to continue.</p>
+    <div class="fgroup"><label>New Password (min 8 chars)</label><input id="new-pass-1" type="password" placeholder="••••••••"/></div>
+    <div class="fgroup"><label>Confirm Password</label><input id="new-pass-2" type="password" placeholder="••••••••"/></div>
+    <button id="change-pass-btn" class="btn btn-primary" onclick="doChangePassword()">Set New Password</button>
+    <div style="margin-top:12px;text-align:center"><button class="btn-signout" style="border:none;background:transparent;cursor:pointer;font-size:13px;color:var(--muted)" onclick="doSignOut()">← Sign out</button></div>
+  </div>
+</div>
+
+<!-- ══ COMPANY DASHBOARD ══════════════════════════════════════════════════════ -->
+<div id="company-section" class="page-section hidden">
   <nav class="topnav">
     <div class="topnav-inner">
       <div class="logo">
-        <div class="logo-mark">🏢</div>
-        <div><div class="logo-text" id="admin-society">Society</div><div class="logo-sub" id="admin-email-lbl"></div></div>
+        <div class="logo-mark company-logo-mark">🏢</div>
+        <div><div class="logo-text">Solutions4Society</div><div class="logo-sub">Company Admin Panel</div></div>
       </div>
       <div class="nav-right">
-        <div class="nav-clock" id="admin-clock"></div>
+        <span class="company-badge">COMPANY</span>
+        <div class="nav-clock" id="company-clock"></div>
         <button class="btn-guide" onclick="openGuide()">❓ Guide</button>
         <button class="btn-signout" onclick="doSignOut()">Sign out</button>
       </div>
     </div>
   </nav>
   <div class="inner-wrap">
-    <div class="page-title">Admin Dashboard</div>
-    <div class="page-sub" id="admin-date"></div>
+    <div class="page-title">Company Dashboard</div>
+    <div class="page-sub">Manage all societies, staff and attendance from one place.</div>
     <div class="tab-row">
-      <button class="adm-tab-btn active" data-atab="attendance" onclick="showAdminTab('attendance')">📋 Attendance</button>
-      <button class="adm-tab-btn" data-atab="staff" onclick="showAdminTab('staff')">👥 Manage Staff</button>
+      <button class="co-tab-btn active" data-cotab="societies" onclick="showCompanyTab('societies')">🏘️ Societies</button>
+      <button class="co-tab-btn" data-cotab="staff"     onclick="showCompanyTab('staff')">👥 All Staff</button>
+      <button class="co-tab-btn" data-cotab="reports"   onclick="showCompanyTab('reports')">📊 Reports</button>
+    </div>
+
+    <!-- Societies panel -->
+    <div id="copanel-societies" class="co-panel">
+      <div class="add-form">
+        <h3>🏘️ Create New Society</h3>
+        <div class="form-row" style="margin-bottom:12px">
+          <div class="fgroup"><label>Society Name *</label><input id="co-soc-name" type="text" placeholder="e.g. Greenview Residency"/></div>
+          <div class="fgroup"><label>Admin Email * (receives login)</label><input id="co-soc-email" type="email" placeholder="admin@society.com"/></div>
+        </div>
+        <div class="form-row" style="margin-bottom:12px">
+          <div class="fgroup"><label>Address</label><input id="co-soc-address" type="text" placeholder="Building address"/></div>
+          <div class="fgroup"><label>Contact Number</label><input id="co-soc-contact" type="text" placeholder="+91 98765 43210"/></div>
+        </div>
+        <button id="create-soc-btn" class="btn btn-company" onclick="createSociety()">Create Society & Send Credentials</button>
+        <div id="new-soc-creds" style="margin-top:12px"></div>
+      </div>
+      <div class="sec-title">All Societies</div>
+      <div id="co-societies-list"><div class="empty-state">Loading…</div></div>
+    </div>
+
+    <!-- All Staff panel -->
+    <div id="copanel-staff" class="co-panel hidden">
+      <div class="tbl-wrap">
+        <div id="co-staff-list"><div class="empty-state">Loading…</div></div>
+      </div>
+    </div>
+
+    <!-- Reports panel -->
+    <div id="copanel-reports" class="co-panel hidden">
+      <div style="margin-bottom:18px">
+        <button class="btn btn-company" style="width:auto;padding:11px 20px" onclick="exportAllSocietiesReport()">⬇ Export All Societies Report</button>
+      </div>
+      <div class="sec-title">Export by Society</div>
+      <div id="co-reports-list"><div class="empty-state">Loading…</div></div>
+    </div>
+  </div>
+</div>
+
+<!-- ══ SOCIETY VIEW MODAL (company viewing a society) ════════════════════════ -->
+<div id="co-view-modal" class="modal-overlay hidden" onclick="closeCoViewModal()">
+  <div class="modal-box co-view-modal-box" onclick="event.stopPropagation()">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px">
+      <div class="modal-title" id="co-view-modal-title" style="margin:0">Attendance</div>
+      <button class="icon-btn" onclick="closeCoViewModal()" style="border:none;background:transparent;font-size:18px;cursor:pointer">✕</button>
+    </div>
+    <div class="tbl-wrap">
+      <table><thead><tr><th>Name</th><th>Designation</th><th>Today's Entries</th><th>Hours</th><th>Status</th></tr></thead>
+      <tbody id="co-view-tbody"><tr><td colspan="5" class="empty-state">Loading…</td></tr></tbody></table>
+    </div>
+  </div>
+</div>
+
+<!-- ══ SOCIETY DASHBOARD ══════════════════════════════════════════════════════ -->
+<div id="society-section" class="page-section hidden">
+  <nav class="topnav">
+    <div class="topnav-inner">
+      <div class="logo">
+        <div class="logo-mark">🏘️</div>
+        <div><div class="logo-text" id="soc-name-display">Society</div><div class="logo-sub" id="soc-email-display"></div></div>
+      </div>
+      <div class="nav-right">
+        <div class="nav-clock" id="soc-clock"></div>
+        <button class="btn-guide" onclick="openGuide()">❓ Guide</button>
+        <button class="btn-signout" onclick="doSignOut()">Sign out</button>
+      </div>
+    </div>
+  </nav>
+  <div class="inner-wrap">
+    <div class="page-title">Society Dashboard</div>
+    <div class="page-sub" id="soc-date"></div>
+    <div class="tab-row">
+      <button class="soc-tab-btn active" data-soctab="attendance" onclick="showSocietyTab('attendance')">📋 Attendance</button>
+      <button class="soc-tab-btn" data-soctab="staff"      onclick="showSocietyTab('staff')">👥 Manage Staff</button>
     </div>
 
     <!-- Attendance panel -->
-    <div id="apanel-attendance" class="admin-panel">
+    <div id="socpanel-attendance" class="soc-panel">
       <div class="summary-grid">
         <div class="sum-card"><div class="sum-label">Total Staff</div><div class="sum-value" id="card-total">—</div></div>
         <div class="sum-card"><div class="sum-label">Present</div><div class="sum-value val-green" id="card-present">—</div></div>
@@ -807,35 +1242,36 @@ tr:last-child td{border-bottom:none;}
     </div>
 
     <!-- Manage Staff panel -->
-    <div id="apanel-staff" class="admin-panel hidden">
+    <div id="socpanel-staff" class="soc-panel hidden">
       <div class="add-form">
         <h3>➕ Add New Staff Member</h3>
-        <div class="form-row">
+        <div class="form-row" style="margin-bottom:12px">
           <div class="fgroup"><label>Full Name</label><input id="new-name" type="text" placeholder="e.g. Ravi Kumar"/></div>
           <div class="fgroup"><label>Email (used to login)</label><input id="new-email" type="email" placeholder="ravi@gmail.com"/></div>
         </div>
-        <div class="form-row">
+        <div class="form-row" style="margin-bottom:12px">
           <div class="fgroup"><label>Designation</label><input id="new-desig" type="text" placeholder="e.g. Security Guard"/></div>
-          <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;">
+          <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px">
             <div class="fgroup"><label>Shift Start</label><input id="new-shift-start" type="time" value="09:00"/></div>
             <div class="fgroup"><label>Shift End</label><input id="new-shift-end" type="time" value="18:00"/></div>
           </div>
         </div>
-        <button class="btn btn-primary" onclick="addStaff()">Add Staff Member</button>
+        <button id="add-staff-btn" class="btn btn-primary" onclick="addSocietyStaff()">Add Staff Member</button>
+        <div id="new-staff-creds" style="margin-top:12px"></div>
       </div>
-      <div class="sec-title">All Staff <span style="font-size:12px;color:var(--muted);font-weight:400">(click a card to view their full attendance history)</span></div>
-      <div id="staff-list-admin"><div class="empty-state">Loading…</div></div>
+      <div class="sec-title">All Staff <span style="font-size:12px;color:var(--muted);font-weight:400">(click a card to view attendance history)</span></div>
+      <div id="soc-staff-list"><div class="empty-state">Loading…</div></div>
     </div>
   </div>
 </div>
 
-<!-- ══════════════════ STAFF DASHBOARD ══════════════════ -->
+<!-- ══ STAFF DASHBOARD ════════════════════════════════════════════════════════ -->
 <div id="staff-section" class="page-section hidden">
   <nav class="topnav">
     <div class="topnav-inner">
       <div class="logo">
         <div class="logo-mark">👤</div>
-        <div><div class="logo-text" id="staff-society-name">My Attendance</div><div class="logo-sub">Staff Portal</div></div>
+        <div><div class="logo-text" id="staff-society-name">Society</div><div class="logo-sub">Staff Portal</div></div>
       </div>
       <div class="nav-right">
         <button class="btn-guide" onclick="openGuide()">❓ Guide</button>
@@ -843,7 +1279,7 @@ tr:last-child td{border-bottom:none;}
       </div>
     </div>
   </nav>
-  <div class="inner-wrap" style="max-width:520px;">
+  <div class="inner-wrap" style="max-width:520px">
     <div class="staff-hero">
       <div class="big-avatar" id="staff-initials-big">?</div>
       <div style="font-size:22px;font-weight:800" id="staff-welcome">Staff</div>
@@ -852,24 +1288,17 @@ tr:last-child td{border-bottom:none;}
       <div class="big-clock" id="staff-clock"></div>
       <div style="font-size:13px;color:var(--muted)" id="staff-date"></div>
     </div>
-
     <div class="time-grid">
       <div class="time-box"><div class="time-label">First In</div><div class="time-value" id="display-in" style="color:var(--accent)">—</div></div>
       <div class="time-box"><div class="time-label">Last Out</div><div class="time-value" id="display-out" style="color:var(--accent2)">—</div></div>
     </div>
-
     <div id="today-entries" class="today-entries" style="display:none"></div>
-
     <div class="action-row">
-      <button class="btn btn-primary" id="btn-checkin" onclick="askCheckIn()">✅ Check In</button>
-      <button class="btn btn-danger" id="btn-checkout" onclick="askCheckOut()" disabled>🏁 Check Out</button>
+      <button class="btn btn-primary" id="btn-checkin"  onclick="askCheckIn()">✅ Check In</button>
+      <button class="btn btn-danger"  id="btn-checkout" onclick="askCheckOut()" disabled>🏁 Check Out</button>
     </div>
-
-    <div class="info-box">
-      💡 Tap <b>Check In</b> when you arrive and <b>Check Out</b> when you leave. A confirmation popup prevents accidental taps. You can check in and out <b>multiple times per day</b> (e.g. after a lunch break). Admin is notified automatically every time.
-    </div>
-
-    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;">
+    <div class="info-box">💡 Tap <b>Check In</b> when you arrive and <b>Check Out</b> when you leave. A confirmation popup prevents accidental taps. You can check in and out <b>multiple times per day</b>. Admin is notified automatically.</div>
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">
       <div class="sec-title" style="margin:0">📅 My Attendance History</div>
       <button class="btn btn-secondary" style="width:auto;padding:9px 14px;font-size:13px" onclick="exportMyCSV()">⬇ Export CSV</button>
     </div>
@@ -877,161 +1306,123 @@ tr:last-child td{border-bottom:none;}
   </div>
 </div>
 
-<!-- ══════════════════ EDIT STAFF MODAL ══════════════════ -->
+<!-- ══ EDIT STAFF MODAL ═══════════════════════════════════════════════════════ -->
 <div id="edit-modal" class="modal-overlay hidden" onclick="closeEditModal()">
   <div class="modal-box" onclick="event.stopPropagation()">
     <div class="modal-title">✏️ Edit Staff Details</div>
     <input id="edit-id" type="hidden"/>
-    <div style="display:flex;flex-direction:column;gap:12px;">
-      <div class="fgroup"><label>Full Name</label><input id="edit-name" type="text"/></div>
-      <div class="fgroup"><label>Email (read-only — login key)</label><input id="edit-email" type="email" disabled style="opacity:.5"/></div>
-      <div class="fgroup"><label>Designation</label><input id="edit-desig" type="text"/></div>
-      <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;">
-        <div class="fgroup"><label>Shift Start</label><input id="edit-shift-start" type="time"/></div>
-        <div class="fgroup"><label>Shift End</label><input id="edit-shift-end" type="time"/></div>
-      </div>
+    <div class="fgroup"><label>Full Name</label><input id="edit-name" type="text"/></div>
+    <div class="fgroup"><label>Email (login key — read only)</label><input id="edit-email" type="email" disabled style="opacity:.5"/></div>
+    <div class="fgroup"><label>Designation</label><input id="edit-desig" type="text"/></div>
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px">
+      <div class="fgroup"><label>Shift Start</label><input id="edit-shift-start" type="time"/></div>
+      <div class="fgroup"><label>Shift End</label><input id="edit-shift-end" type="time"/></div>
     </div>
     <div class="modal-actions">
       <button class="btn btn-secondary" onclick="closeEditModal()" style="flex:1">Cancel</button>
-      <button class="btn btn-primary" onclick="saveEdit()" style="flex:1">Save Changes</button>
+      <button class="btn btn-primary"   onclick="saveEdit()"       style="flex:1">Save</button>
     </div>
   </div>
 </div>
 
-<!-- ══════════════════ STAFF HISTORY MODAL ══════════════════ -->
+<!-- ══ STAFF HISTORY MODAL ═══════════════════════════════════════════════════ -->
 <div id="hist-modal" class="modal-overlay hidden" onclick="closeHistModal()">
   <div class="modal-box hist-modal-box" onclick="event.stopPropagation()">
-    <div style="display:flex;align-items:center;gap:12px;margin-bottom:18px;">
+    <div style="display:flex;align-items:center;gap:12px;margin-bottom:16px">
       <div class="savatar" id="hist-initials" style="width:40px;height:40px;font-size:13px">?</div>
-      <div style="flex:1"><div style="font-weight:800;font-size:16px" id="hist-name">Staff</div><div style="font-size:12.5px;color:var(--muted)" id="hist-desig"></div></div>
+      <div style="flex:1"><div style="font-weight:800;font-size:15px" id="hist-name">Staff</div><div style="font-size:12px;color:var(--muted)" id="hist-desig"></div></div>
       <button class="icon-btn" onclick="closeHistModal()" style="border:none;background:transparent;font-size:18px;cursor:pointer">✕</button>
     </div>
     <div class="hist-range-row">
-      <div class="fgroup"><label>From</label><input id="hist-from" type="date" onchange="loadStaffHistory()"/></div>
-      <div class="fgroup"><label>To</label><input id="hist-to" type="date" onchange="loadStaffHistory()"/></div>
-      <button class="btn btn-secondary" style="width:auto;padding:11px 16px" onclick="loadStaffHistory()">🔍 Search</button>
-      <button class="btn btn-primary" style="width:auto;padding:11px 16px" onclick="exportStaffCSV()">⬇ Export</button>
+      <div class="fgroup" style="margin:0"><label>From</label><input id="hist-from" type="date" onchange="loadStaffHistory()"/></div>
+      <div class="fgroup" style="margin:0"><label>To</label><input id="hist-to" type="date" onchange="loadStaffHistory()"/></div>
+      <button class="btn btn-secondary" style="width:auto;padding:11px 14px" onclick="loadStaffHistory()">🔍 Search</button>
+      <button class="btn btn-primary"   style="width:auto;padding:11px 14px" onclick="exportStaffCSV()">⬇ Export</button>
     </div>
-    <div class="tbl-wrap" style="max-height:340px;overflow-y:auto;">
-      <table>
-        <thead><tr><th>Date</th><th>Entries</th><th>Total Hours</th><th>Status</th></tr></thead>
-        <tbody id="hist-tbody"><tr><td colspan="4" class="empty-state">Loading…</td></tr></tbody>
-      </table>
+    <div class="tbl-wrap" style="max-height:340px;overflow-y:auto">
+      <table><thead><tr><th>Date</th><th>Entries</th><th>Total Hours</th><th>Status</th></tr></thead>
+      <tbody id="hist-tbody"><tr><td colspan="4" class="empty-state">Loading…</td></tr></tbody></table>
     </div>
   </div>
 </div>
 
-<!-- ══════════════════ CONFIRM CHECK-IN/OUT MODAL ══════════════════ -->
+<!-- ══ CONFIRM CHECK-IN/OUT MODAL ════════════════════════════════════════════ -->
 <div id="confirm-modal" class="modal-overlay hidden" onclick="closeConfirm()">
-  <div class="modal-box" onclick="event.stopPropagation()" style="text-align:center;max-width:340px;">
+  <div class="modal-box" onclick="event.stopPropagation()" style="text-align:center;max-width:340px">
     <div id="confirm-title" class="modal-title" style="margin-bottom:6px">Confirm Entry</div>
     <div id="confirm-desc" style="font-size:13.5px;color:var(--muted);margin-bottom:12px"></div>
     <div id="confirm-time" class="big-clock" style="font-size:32px;margin:0 0 20px"></div>
-    <div style="display:flex;gap:10px;">
+    <div style="display:flex;gap:10px">
       <button class="btn btn-secondary" onclick="closeConfirm()" style="flex:1">Cancel</button>
       <button id="confirm-btn" class="btn btn-primary" onclick="doConfirm()" style="flex:1.4">✅ Confirm Entry</button>
     </div>
-    <div style="margin-top:12px;font-size:12px;color:var(--muted)">📧 Admin will be notified automatically.</div>
+    <div style="margin-top:12px;font-size:12px;color:var(--muted)">📧 Society admin will be notified automatically.</div>
   </div>
 </div>
 
-<!-- ══════════════════ GUIDE MODAL ══════════════════ -->
+<!-- ══ GUIDE MODAL ════════════════════════════════════════════════════════════ -->
 <div id="guide-modal" class="modal-overlay hidden" onclick="closeGuide()">
   <div class="modal-box guide-modal-box" onclick="event.stopPropagation()">
     <div class="guide-header">
       <button class="guide-close-btn" onclick="closeGuide()">✕</button>
-      <h2>📖 How to Use This App</h2>
-      <p>Society Attendance Portal — complete guide for admins and staff</p>
+      <h2>📖 Platform Guide</h2>
+      <p>Solutions4Society — Attendance Management Platform</p>
     </div>
     <div class="guide-body">
-
       <div class="g-section">
-        <div class="g-section-title">👥 Two Roles — One App</div>
-        <div class="g-role-card g-admin-card">
-          <div class="g-role-title">🏢 Admin (Society Office)</div>
-          <div class="g-step"><div class="g-step-num">1</div><div class="g-step-text">Go to <b>Register Admin</b> tab → enter your society name, email and password → create your account. Do this only once.</div></div>
-          <div class="g-step"><div class="g-step-num">2</div><div class="g-step-text">After logging in, click <b>Manage Staff</b> tab → fill in each staff member's name, their email address, designation, and shift times → click <b>Add Staff Member</b>.</div></div>
-          <div class="g-step"><div class="g-step-num">3</div><div class="g-step-text">The <b>Attendance</b> tab shows all staff check-ins for today in real time. Summary cards at the top show Present / Late / Absent counts.</div></div>
-          <div class="g-step"><div class="g-step-num">4</div><div class="g-step-text"><b>Click any staff card</b> in Manage Staff to open their full attendance history. Pick a date range, view all entries, and export to CSV.</div></div>
-        </div>
-        <div class="g-role-card g-staff-card">
-          <div class="g-role-title">👤 Staff (Housekeeping / Security / etc.)</div>
-          <div class="g-step"><div class="g-step-num g-step-num-t">1</div><div class="g-step-text">Open this same link on your phone. Tap <b>Sign in with Google</b> using the <b>exact email</b> your admin registered you with. Do not create a new account.</div></div>
-          <div class="g-step"><div class="g-step-num g-step-num-t">2</div><div class="g-step-text">Your name, designation, and shift load automatically. The society name appears at the top.</div></div>
-          <div class="g-step"><div class="g-step-num g-step-num-t">3</div><div class="g-step-text">Tap <b>✅ Check In</b> when you arrive → a popup shows the exact time → tap <b>Confirm Entry</b> to save it.</div></div>
-          <div class="g-step"><div class="g-step-num g-step-num-t">4</div><div class="g-step-text">Tap <b>🏁 Check Out</b> when you leave. If you come back after lunch, tap Check In again — multiple entries per day are supported.</div></div>
-          <div class="g-step"><div class="g-step-num g-step-num-t">5</div><div class="g-step-text">Your full attendance history is below the buttons. Tap <b>⬇ Export CSV</b> to download it as proof.</div></div>
-        </div>
+        <div class="g-section-title">🏢 Three Roles</div>
+        <div class="g-item"><div class="g-icon gi-indigo">🏢</div><div><div class="g-item-title">Company (Solutions4Society)</div><div class="g-item-desc">Creates and manages all societies. Can view all attendance across all societies. Exports full reports. Enables/disables societies.</div></div></div>
+        <div class="g-item"><div class="g-icon gi-purple">🏘️</div><div><div class="g-item-title">Society Admin</div><div class="g-item-desc">Logs in with credentials sent by Solutions4Society. Manages their own staff — add, edit, enable/disable. Views their own attendance only. Cannot see other societies.</div></div></div>
+        <div class="g-item"><div class="g-icon gi-teal">👤</div><div><div class="g-item-title">Staff</div><div class="g-item-desc">Logs in with credentials sent by society admin. Can only check in/out and view their own history. Cannot see other staff or society settings.</div></div></div>
       </div>
-
       <div class="g-section">
-        <div class="g-section-title">🔘 What Every Button Does</div>
-        <div class="g-item"><div class="g-icon gi-purple">🔑</div><div><div class="g-item-title">Sign in with Google<span class="g-badge gb-both">Both</span></div><div class="g-item-desc">Opens Google's secure login. Admins use any Google account. Staff <b>must</b> use the email the admin registered them with — any other email shows "Account not recognised."</div></div></div>
-        <div class="g-item"><div class="g-icon gi-purple">📝</div><div><div class="g-item-title">Register Admin<span class="g-badge gb-admin">Admin only</span></div><div class="g-item-desc">Creates a new society office account with email + password. Each society registers separately — data is 100% private. <b>Staff do not register here.</b></div></div></div>
-        <div class="g-item"><div class="g-icon gi-purple">➕</div><div><div class="g-item-title">Add Staff Member<span class="g-badge gb-admin">Admin only</span></div><div class="g-item-desc">Adds a staff profile. The email you enter here is the login key for that staff member — it <b>must exactly match</b> their Google account email. Once added, they can sign in immediately.</div></div></div>
-        <div class="g-item"><div class="g-icon gi-teal">✏️</div><div><div class="g-item-title">Edit Staff (pencil icon)<span class="g-badge gb-admin">Admin only</span></div><div class="g-item-desc">Change a staff member's name, designation, or shift. Email cannot be edited (it's the login identity) — to change email, delete and re-add the staff member.</div></div></div>
-        <div class="g-item"><div class="g-icon gi-pink">🗑️</div><div><div class="g-item-title">Delete Staff (bin icon)<span class="g-badge gb-admin">Admin only</span></div><div class="g-item-desc">Removes the staff profile permanently. The person can no longer log in. Past attendance records remain in the database.</div></div></div>
-        <div class="g-item"><div class="g-icon gi-purple">👤</div><div><div class="g-item-title">Click a Staff Card<span class="g-badge gb-admin">Admin only</span></div><div class="g-item-desc">Opens that person's full attendance history. Select From and To dates → click <b>Search</b> (or just change the dates — it auto-searches). <b>Export</b> downloads a CSV with every entry-pair as a separate row.</div></div></div>
-        <div class="g-item"><div class="g-icon gi-teal">✅</div><div><div class="g-item-title">Check In<span class="g-badge gb-staff">Staff only</span></div><div class="g-item-desc">Marks arrival. Opens a confirmation popup showing the exact time — tap <b>Confirm Entry</b>. Saves to the database and auto-emails the admin. Available again after each check-out (for multiple entries per day).</div></div></div>
-        <div class="g-item"><div class="g-icon gi-pink">🏁</div><div><div class="g-item-title">Check Out<span class="g-badge gb-staff">Staff only</span></div><div class="g-item-desc">Marks departure. Only active after checking in. Tap <b>Confirm Exit</b>. Admin is notified automatically. After checkout, Check In becomes available again.</div></div></div>
-        <div class="g-item"><div class="g-icon gi-amber">⬇️</div><div><div class="g-item-title">Export CSV<span class="g-badge gb-both">Both</span></div><div class="g-item-desc"><b>Admin (Attendance tab):</b> exports all staff for today. <b>Admin (staff card popup):</b> exports one staff member's selected date range. <b>Staff:</b> exports your complete personal history — use as proof of attendance.</div></div></div>
-        <div class="g-item"><div class="g-icon gi-green">🔒</div><div><div class="g-item-title">Forgot Password<span class="g-badge gb-admin">Admin only</span></div><div class="g-item-desc">Sends a reset link to the admin's email. Works only for email/password accounts. Google Sign-In passwords are managed by Google.</div></div></div>
-        <div class="g-item"><div class="g-icon gi-pink">↩️</div><div><div class="g-item-title">Sign Out<span class="g-badge gb-both">Both</span></div><div class="g-item-desc">Securely logs out. Important on shared devices — the next person will see the login screen fresh.</div></div></div>
-      </div>
-
-      <div class="g-section">
-        <div class="g-section-title">📧 How Emails Work</div>
-        <div class="g-email-box"><div class="g-email-type">✅ Check-In / 🏁 Check-Out Notifications</div><div class="g-email-desc">Sent automatically to the <b>admin's registered email</b> every time a staff member confirms an entry or exit. No manual step needed. Contains staff name, action (Checked IN / OUT), exact time, and date.</div></div>
-        <div class="g-email-box"><div class="g-email-type">🔒 Password Reset</div><div class="g-email-desc">Sent by Firebase (Google) when "Forgot password?" is clicked. Valid for 1 hour. Only works for email/password accounts.</div></div>
-        <div class="g-email-box" style="border-color:var(--accent2)"><div class="g-email-type" style="color:var(--accent2)">⚠️ "Account not recognised" — What it means</div><div class="g-email-desc">The email the staff member signed in with does not match what the admin registered. Fix: admin goes to <b>Manage Staff</b>, checks the email on that staff card, and corrects it. Or the staff member should sign in with a Google account that matches the registered email.</div></div>
-      </div>
-
-      <div class="g-section">
-        <div class="g-section-title">🔄 Multiple Check-Ins Per Day</div>
-        <div class="g-item"><div class="g-icon gi-teal">🍽️</div><div><div class="g-item-title">Lunch Breaks &amp; Return Visits</div><div class="g-item-desc">Staff can check in and out any number of times in one day. Example: arrive 9 AM → check in. Leave for lunch 1 PM → check out. Return 2 PM → check in again. Leave 6 PM → check out.<br><br>All pairs (9–1 PM and 2–6 PM) are stored. Total hours = 8h 00m. The attendance table and CSV show each pair numbered (1. 9:00 AM → 1:00 PM | 2. 2:00 PM → 6:00 PM).</div></div></div>
-      </div>
-
-      <div class="g-section">
-        <div class="g-section-title">🛡️ Firestore Security Rules — Required Setup</div>
-        <div class="g-item">
-          <div class="g-icon gi-amber">⚙️</div>
-          <div>
-            <div class="g-item-title" style="color:#D97706">If staff list or attendance shows "Loading…" forever or a permission error</div>
-            <div class="g-item-desc">
-              Your Firestore database is in Production mode which blocks all reads/writes by default.
-              You need to paste these rules once:<br><br>
-              1. Go to <a href="https://console.firebase.google.com/project/society-attendance/firestore/rules" target="_blank">Firebase Console → Firestore → Rules</a><br>
-              2. Replace everything with the rules below<br>
-              3. Click <b>Publish</b><br><br>
-              <div style="background:#1F1B33;color:#A5F3FC;border-radius:8px;padding:14px;font-family:var(--mono);font-size:11.5px;line-height:1.7;white-space:pre-wrap;user-select:all;">rules_version = '2';
+        <div class="g-section-title">🚀 First-Time Company Setup</div>
+        <div class="g-item"><div class="g-icon gi-amber">⚙️</div><div><div class="g-item-title">Step 1 — Get your Company UID</div><div class="g-item-desc">Log in once with your Solutions4Society email. Open browser console (F12). Copy the UID shown as "Company UID: xxx". Paste it into COMPANY_UID in the HTML file. Re-upload.</div></div></div>
+        <div class="g-item"><div class="g-icon gi-amber">🛡️</div><div><div class="g-item-title">Step 2 — Update Firestore Rules</div><div class="g-item-desc">Copy the rules below into Firebase Console → Firestore → Rules → Publish.<div class="rules-box">rules_version = '2';
 service cloud.firestore {
   match /databases/{database}/documents {
-    match /admins/{uid} {
-      allow read: if request.auth != null;
+    match /userRoles/{uid} {
+      allow read: if request.auth != null
+                  && request.auth.uid == uid;
       allow write: if request.auth != null
-                   && request.auth.uid == uid;
+                   && request.auth.uid == resource.data.get('companyUid', uid);
     }
-    match /staff/{staffId} {
-      allow read: if request.auth != null;
-      allow write: if request.auth != null;
+    match /societies/{societyId} {
+      allow read: if request.auth != null
+        && (get(/databases/$(database)/documents/userRoles/$(request.auth.uid)).data.role == 'company'
+        || get(/databases/$(database)/documents/userRoles/$(request.auth.uid)).data.societyId == societyId);
+      allow write: if request.auth != null
+        && get(/databases/$(database)/documents/userRoles/$(request.auth.uid)).data.role == 'company';
     }
-    match /attendance/{logId} {
-      allow read, write: if request.auth != null;
+    match /societies/{societyId}/staff/{staffId} {
+      allow read: if request.auth != null
+        && (get(/databases/$(database)/documents/userRoles/$(request.auth.uid)).data.role == 'company'
+        || get(/databases/$(database)/documents/userRoles/$(request.auth.uid)).data.societyId == societyId);
+      allow write: if request.auth != null
+        && (get(/databases/$(database)/documents/userRoles/$(request.auth.uid)).data.role == 'company'
+        || get(/databases/$(database)/documents/userRoles/$(request.auth.uid)).data.role == 'society');
+    }
+    match /societies/{societyId}/attendance/{logId} {
+      allow read: if request.auth != null
+        && (get(/databases/$(database)/documents/userRoles/$(request.auth.uid)).data.role == 'company'
+        || get(/databases/$(database)/documents/userRoles/$(request.auth.uid)).data.societyId == societyId);
+      allow write: if request.auth != null
+        && get(/databases/$(database)/documents/userRoles/$(request.auth.uid)).data.societyId == societyId;
     }
   }
-}</div>
-              <br>Click anywhere inside the code box above to select all, then copy and paste into Firebase Console.
-            </div>
-          </div>
-        </div>
+}</div></div></div></div>
       </div>
-
       <div class="g-section">
-        <div class="g-section-title">🔐 Privacy &amp; Data</div>
-        <div class="g-item"><div class="g-icon gi-purple">🏢</div><div><div class="g-item-title">Each Society's Data is Completely Isolated</div><div class="g-item-desc">Ratna Apt and Mansi Residency (for example) each have their own admin account. Their staff lists and attendance records are entirely separate — no society can ever see another's data.</div></div></div>
-        <div class="g-item"><div class="g-icon gi-green">☁️</div><div><div class="g-item-title">Stored Permanently in Google Firebase</div><div class="g-item-desc">All data lives in Google Firestore (cloud database). Closing the browser, refreshing, or switching devices never loses records. History goes back as far as the first check-in ever recorded.</div></div></div>
+        <div class="g-section-title">📧 Email Flows</div>
+        <div class="g-item"><div class="g-icon gi-green">🏘️</div><div><div class="g-item-title">Society Created</div><div class="g-item-desc">Society admin receives their portal URL, login email, and temporary password. They must change the password on first login.</div></div></div>
+        <div class="g-item"><div class="g-icon gi-teal">👤</div><div><div class="g-item-title">Staff Added</div><div class="g-item-desc">Staff member receives the portal link, login email, and temporary password. They must change it on first login.</div></div></div>
+        <div class="g-item"><div class="g-icon gi-purple">✅</div><div><div class="g-item-title">Check-In / Check-Out</div><div class="g-item-desc">Society admin's email receives an automatic notification every time a staff member checks in or out. No action needed.</div></div></div>
       </div>
-
+      <div class="g-section">
+        <div class="g-section-title">🔐 Security</div>
+        <div class="g-item"><div class="g-icon gi-pink">🔒</div><div><div class="g-item-title">Data Isolation</div><div class="g-item-desc">Society data lives in /societies/{societyId}/staff and /societies/{societyId}/attendance subcollections. Firestore rules enforce that a society can only read its own subcollection path — even if someone manually modifies the URL, they get a permission error, not another society's data.</div></div></div>
+        <div class="g-item"><div class="g-icon gi-pink">👤</div><div><div class="g-item-title">Role-Based Access</div><div class="g-item-desc">Every user's role (company / society / staff) is stored in /userRoles/{uid} and checked server-side by Firestore rules. The client cannot fake a role — even by editing JS in the browser, data access is blocked at the database layer.</div></div></div>
+      </div>
     </div>
   </div>
 </div>
